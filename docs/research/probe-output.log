@@ -1,0 +1,39 @@
+[1790965051044] connected to session bus (unique: Some(OwnedUniqueName(":1.692")))
+[1790965051044] Subscribe() ok
+[1790965055049] org.freedesktop.systemd1.Manager UnitNew @ /org/freedesktop/systemd1
+[1790965055049] JobNew     unit=uss-research-test.service job=/org/freedesktop/systemd1/job/2734 id=2734
+[1790965055049] org.freedesktop.systemd1.Manager UnitNew @ /org/freedesktop/systemd1
+[1790965055049] PropertiesChanged @ /org/freedesktop/systemd1/unit/_2d_2emount
+[1790965055049] PropertiesChanged @ /org/freedesktop/systemd1/unit/_2d_2emount
+[1790965055049] PropertiesChanged @ /org/freedesktop/systemd1/unit/home_2emount
+[1790965055049] PropertiesChanged @ /org/freedesktop/systemd1/unit/home_2emount
+[1790965055049] PropertiesChanged @ /org/freedesktop/systemd1/unit/shutdown_2etarget
+[1790965055049] PropertiesChanged @ /org/freedesktop/systemd1/unit/basic_2etarget
+[1790965055049] PropertiesChanged @ /org/freedesktop/systemd1/unit/app_2eslice
+[1790965055049] org.freedesktop.systemd1.Manager UnitRemoved @ /org/freedesktop/systemd1
+[1790965055049] GetUnit -> /org/freedesktop/systemd1/unit/uss_2dresearch_2dtest_2eservice
+[1790965055050] PropertiesChanged @ /org/freedesktop/systemd1/unit/uss_2dresearch_2dtest_2eservice
+[1790965055050] PropertiesChanged @ /org/freedesktop/systemd1/unit/uss_2dresearch_2dtest_2eservice
+[1790965055050] PropertiesChanged @ /org/freedesktop/systemd1/unit/uss_2dresearch_2dtest_2eservice
+[1790965055050] PropertiesChanged @ /org/freedesktop/systemd1/unit/uss_2dresearch_2dtest_2eservice
+[1790965055050] JobRemoved unit=uss-research-test.service job=/org/freedesktop/systemd1/job/2734 id=2734 result=done
+[1790965055050] PropertiesChanged @ /org/freedesktop/systemd1/unit/uss_2dresearch_2dtest_2eservice
+[1790965055050] PropertiesChanged @ /org/freedesktop/systemd1/unit/uss_2dresearch_2dtest_2eservice
+[1790965055050] ActiveState (first seen): active
+[1790965055051] PropertiesChanged @ /org/freedesktop/systemd1/unit/uss_2dresearch_2dtest_2eservice
+[1790965055051] PropertiesChanged @ /org/freedesktop/systemd1/unit/uss_2dresearch_2dtest_2eservice
+[1790965055051] JobNew     unit=uss-research-test.service job=/org/freedesktop/systemd1/job/2755 id=2755
+[1790965055051] StopUnit() -> job /org/freedesktop/systemd1/job/2755
+[1790965055051] PropertiesChanged @ /org/freedesktop/systemd1/unit/uss_2dresearch_2dtest_2eservice
+[1790965055051] PropertiesChanged @ /org/freedesktop/systemd1/unit/uss_2dresearch_2dtest_2eservice
+[1790965055051] PropertiesChanged @ /org/freedesktop/systemd1/unit/uss_2dresearch_2dtest_2eservice
+[1790965055051] PropertiesChanged @ /org/freedesktop/systemd1/unit/uss_2dresearch_2dtest_2eservice
+[1790965055051] PropertiesChanged @ /org/freedesktop/systemd1/job/2755
+[1790965055051] unit back to "deactivating" — operation path verified, DONE
+--- async live run (zbus_systemd 0.26200.0 + zbus 5.19, tokio) ---
+[ok] Subscribe()
+[ok] Manager.Version = 260.4
+[ok] GetUnit(dbus-broker.service) -> /org/freedesktop/systemd1/unit/dbus_2dbroker_2eservice
+[ok] dbus-broker.service ActiveState=active SubState=running LoadState=loaded
+[ok] ListUnits -> 494 units
+[..] no JobRemoved within 10s (quiet bus); signal receiver was armed
