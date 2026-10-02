@@ -1,6 +1,6 @@
 # uss/ussd — design spec
 
-**Status:** proposed (PR'd for review) · **Date:** 2026-10-02
+**Status:** proposed — under review ([PR #9](https://github.com/kido5217/user-service-switcher/pull/9)) · **Date:** 2026-10-02
 **Map:** [#4](https://github.com/kido5217/user-service-switcher/issues/4) · **This ticket:** [#6](https://github.com/kido5217/user-service-switcher/issues/6)
 **Decisions consolidated from:** map charting (2026-10-02, two grilling rounds), ticket [#5](https://github.com/kido5217/user-service-switcher/issues/5) (systemd-interface research), ADR-0001, ADR-0002, `CONTEXT.md`.
 
