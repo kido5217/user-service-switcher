@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Nix
+        uses: davidbarbes/actions/setup-nix@v4
+        with:
+          additional-nix-config: |
+            experimental-features = nix-command flakes
+
+      - name: Build package (nix)
+        run: nix build .#packages.x86_64-linux.default
+
+      - name: fmt + clippy + test (nix devShell)
+        run: |
+          nix develop .#devShells.x86_64-linux.default --command bash -c '
+            cargo fmt --check
+            cargo clippy --all-targets -- -D warnings
+            cargo test
+          '
