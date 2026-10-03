@@ -14,9 +14,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Nix
-        uses: davidbarbes/actions/setup-nix@v4
+        uses: DeterminateSystems/nix-installer-action@v23
         with:
-          additional-nix-config: |
+          # standard (non-Determinate) nix, daemon under systemd
+          determinate: false
+          init: systemd
+          extra-conf: |
             experimental-features = nix-command flakes
 
       - name: Build package (nix)
