@@ -105,6 +105,8 @@ vpn
 
 Client-side (uss, before any socket traffic): exit 1 (syntax), exit 7 (user manager absent, ussd binary missing). ussd-side errors arrive as protocol error codes (§6) that uss maps to the table above.
 
+_(Erratum 2026-10-04, PR #28: the row-7 cell `uss: ussd binary not found (…)` shows the full stderr line; the template itself omits the `uss: ` prefix per the column header — the implementation follows the header.)_
+
 ## 5. Group state (`groups.json`)
 
 - **Path:** `$XDG_CONFIG_HOME/uss/groups.json` (default `~/.config/uss/`). Created on demand (dir + file) by ussd; the parent dir is created with mode `0755`, the file `0644`.
