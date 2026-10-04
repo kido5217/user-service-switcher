@@ -15,3 +15,5 @@ Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/do
 ### Git workflow
 
 Standard flow: branch → commit → push → PR → merge (squash) → pull + rebase. `main` is protected — changes land only via a merged PR. The model is permitted to merge.
+
+**Local CI**: there is no GitHub Actions CI. The merge gate is `just ci` green in the dev shell (`nix develop`; the `justfile` at the repo root; `just` ships in the devShell) plus the reviewer's own verification runs. `just ci` = `cargo fmt --check`, clippy `-D warnings`, `cargo test`, `nix build`.
