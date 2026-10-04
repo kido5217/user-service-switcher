@@ -11,5 +11,6 @@ pub mod error;
 pub mod names;
 pub mod protocol;
 pub mod state;
+pub mod systemdctl;
 
 pub use error::{Error, ErrorCode, OpError, OpVerb};
