@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod core;
 pub mod error;
 pub mod names;
 pub mod protocol;

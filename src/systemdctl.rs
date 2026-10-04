@@ -310,6 +310,16 @@ impl FakeSystemdCtl {
         self.set_active_state(unit, ActiveState::Inactive, LoadState::NotFound);
     }
 
+    /// Inject an arbitrary unit state (escape hatch for unusual
+    /// combinations, e.g. a `stub` load state).
+    pub fn set_state(&self, unit: &str, state: UnitState) {
+        self.inner
+            .lock()
+            .unwrap()
+            .states
+            .insert(unit.to_owned(), state);
+    }
+
     // -- jobs (test API) -----------------------------------------------------
 
     /// Give a unit a queued job — subsequent `stop_unit` on it is rejected
