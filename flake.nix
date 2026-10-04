@@ -48,6 +48,7 @@
               rust.clippy
               rust.rustfmt
               p.rust-analyzer
+              p.just # local CI runner (justfile at the repo root)
             ];
           };
         }
