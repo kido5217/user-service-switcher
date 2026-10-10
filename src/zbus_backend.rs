@@ -101,7 +101,9 @@ pub const ERR_ALREADY_SUBSCRIBED: &str = "org.freedesktop.systemd1.AlreadySubscr
 /// A `"fail"`-mode transaction that would displace a queued job
 /// (host-grounded 2026-10-10): the §4.2 conflicting-job rejection.
 pub const ERR_TX_DESTRUCTIVE: &str = "org.freedesktop.systemd1.TransactionIsDestructive";
-/// `GetUnit` for a unit with no file (host-grounded 2026-10-10).
+/// A unit operation on a non-existent unit (`StopUnit`, `GetUnit`; the
+/// same rejection also lands when the unit exists on disk but is not
+/// loaded — host-grounded 2026-10-10/11).
 pub const ERR_NO_SUCH_UNIT: &str = "org.freedesktop.systemd1.NoSuchUnit";
 /// `GetUnitFileState` for a non-existent unit file (host-grounded
 /// 2026-10-10; note: a plain D-Bus name, not a systemd1 one).
@@ -192,6 +194,33 @@ fn unit_name_from_dbus_path(path: &str) -> Option<String> {
         }
     }
     String::from_utf8(raw).ok()
+}
+
+/// The canonical D-Bus path of a unit object (inverse of
+/// [`unit_name_from_dbus_path`]): systemd's `unit_escape` — every
+/// non-alphanumeric byte of the name (byte-wise over its UTF-8 encoding)
+/// is replaced by `_xx` (lowercase hex: `.`→`_2e`, `-`→`_2d`, `_`→`_5f`).
+///
+/// Property reads at this path LOAD the unit on demand and report
+/// `LoadState` as data — `not-found` when no unit file exists — which is
+/// exactly what spec §10's loadability check needs. The
+/// `Manager.GetUnit` method cannot serve that: it rejects with
+/// `NoSuchUnit` for every unit not currently loaded in the manager,
+/// including installed-but-inactive ones (host-grounded, systemd 260,
+/// ticket #20 — the first-vertical e2e caught it).
+fn unit_object_path(name: &str) -> String {
+    let hex = b"0123456789abcdef";
+    let mut escaped = String::with_capacity(name.len() * 3);
+    for &b in name.as_bytes() {
+        if b.is_ascii_alphanumeric() {
+            escaped.push(b as char);
+        } else {
+            escaped.push('_');
+            escaped.push(hex[(b >> 4) as usize] as char);
+            escaped.push(hex[(b & 0x0f) as usize] as char);
+        }
+    }
+    format!("{UNIT_PATH_PREFIX}{escaped}")
 }
 
 // ---------------------------------------------------------------------------
@@ -631,21 +660,12 @@ impl SystemdCtl for ZbusCtl {
 
     async fn get_unit_state(&self, unit: &str) -> Result<UnitState, CtlError> {
         let manager = self.manager().await?;
-        let path = match manager.get_unit(unit.to_owned()).await {
-            Ok(path) => path,
-            // No unit file to load: report the state §10 checks for, like
-            // the fake does — not-found is data, not an error.
-            Err(e) if err_name(&e).as_deref() == Some(ERR_NO_SUCH_UNIT) => {
-                return Ok(UnitState {
-                    load_state: LoadState::NotFound,
-                    active_state: ActiveState::Inactive,
-                });
-            }
-            Err(e) => return Err(map_call_error(e)),
-        };
+        // The canonical unit object path (see [`unit_object_path`]): the
+        // property reads load the unit on demand, and `LoadState` is
+        // data — `not-found` when no unit file exists, like the fake.
         let unit_proxy = UnitProxy::builder(manager.inner().connection())
-            .path(path)
-            .map_err(|_| CtlError::ManagerAbsent)? // invalid reply path = broken manager
+            .path(unit_object_path(unit))
+            .map_err(|_| CtlError::ManagerAbsent)? // invalid by construction = broken manager
             .build()
             .await
             .map_err(map_call_error)?;
@@ -802,6 +822,38 @@ mod tests {
             unit_name_from_dbus_path("/org/freedesktop/systemd1/unit/trunc_5"),
             None // escape cut short at the end of the path
         );
+    }
+
+    #[test]
+    fn unit_object_path_escapes_and_round_trips() {
+        // Literal escapes (systemd's unit_escape; host-grounded by
+        // property reads on these paths, ticket #20).
+        assert_eq!(
+            unit_object_path("sleep-fixture.service"),
+            "/org/freedesktop/systemd1/unit/sleep_2dfixture_2eservice"
+        );
+        assert_eq!(
+            unit_object_path("ussd.service"),
+            "/org/freedesktop/systemd1/unit/ussd_2eservice"
+        );
+        // A literal underscore escapes to `_5f` — never a bare `_`.
+        assert_eq!(
+            unit_object_path("a_b.service"),
+            "/org/freedesktop/systemd1/unit/a_5fb_2eservice"
+        );
+        // Every escape must decode back to the original name (the pump's
+        // edge-key matching depends on the two inverses agreeing),
+        // including non-ASCII names escaped byte-wise.
+        for name in [
+            "sleep-fixture.service",
+            "a.service",
+            "foo@1.service",
+            "x-y_z.target",
+            "héllo.service",
+        ] {
+            let decoded = unit_name_from_dbus_path(&unit_object_path(name));
+            assert_eq!(decoded.as_deref(), Some(name));
+        }
     }
 
     #[test]

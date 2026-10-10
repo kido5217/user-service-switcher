@@ -63,7 +63,7 @@ run_uss() {
   out=$("$USS" "$@" </dev/null 2>"$SCRATCH/err"); rc=$?
   err="$(cat "$SCRATCH/err")"
   echo "----- $label -----"
-  echo "\$ uss $*"
+  if [ "$#" -gt 0 ]; then echo "\$ uss $*"; else echo "\$ uss"; fi
   [ -n "$out" ] && echo "stdout: $out"
   [ -n "$err" ] && echo "stderr: $err"
   echo "exit:   $rc"
@@ -91,6 +91,7 @@ show_state() {
 }
 
 unit_is() { systemctl --user is-active "$1" 2>/dev/null; }
+unit_loadstate() { systemctl --user show -p LoadState --value "$1" 2>/dev/null; }
 
 # -- preflight ----------------------------------------------------------------
 
@@ -136,9 +137,10 @@ teardown() {
   out=$("$USS" </dev/null 2>&1) || true
   [ -z "$out" ] || echo "NOTE: final status not empty: $out"
   echo "== summary: $PASS ok, $FAIL failed =="
+  rm -rf "$SCRATCH"
   [ "$FAIL" -eq 0 ]
 }
-trap 'teardown; rm -rf "$SCRATCH"' EXIT
+trap 'teardown' EXIT
 
 # -- clean slate ---------------------------------------------------------------
 
@@ -177,12 +179,16 @@ systemctl --user daemon-reload
 echo "installed $FIXTURE_UNIT:"
 sed 's/^/  /' "$FIXTURE_UNIT"
 echo
+# Loadability is read on demand from the unit object (spec §10, as the
+# daemon does) — a freshly installed unit reads `loaded` here even before
+# anything else has touched it; no reload race to wait out.
+assert_eq "fixture loaded" "loaded" "$(unit_loadstate sleep-fixture.service)"
 assert_eq "fixture inactive before start" "inactive" "$(unit_is sleep-fixture.service)"
 
 # -- the vertical -----------------------------------------------------------------
 
 # 1. First use: bootstrap installs + starts ussd; no groups → no output.
-run_uss "step 1: uss (first use — bootstrap)" 0 "" ""
+run_uss "step 1: first use (bootstrap)" 0 "" ""
 assert_ok "step 1: unit file == §9 template" cmp -s "$USSD_UNIT" "$SCRATCH/unit.expected"
 assert_eq "step 1: ussd active" "active" "$(unit_is ussd.service)"
 assert_eq "step 1: ussd enabled" "enabled" "$(systemctl --user is-enabled ussd.service 2>/dev/null)"
@@ -192,41 +198,41 @@ UNIT_HASH_1="$(sha256sum "$USSD_UNIT" | cut -d' ' -f1)"
 echo
 
 # 2. add — normalize + loadability check + persist.
-run_uss "step 2: uss dev add sleep-fixture" 0 "" ""
+run_uss "step 2: add" 0 "" "" dev add sleep-fixture
 check_state "step 2" "$STATE_AFTER_ADD"
 show_state
 
 # 3. status — the group prints; no marker while the member is inactive.
-run_uss "step 3: uss (group, member inactive)" 0 "$OUT_DEV_INACTIVE" ""
+run_uss "step 3: status (group, member inactive)" 0 "$OUT_DEV_INACTIVE" ""
 assert_eq "step 3: fixture inactive (live)" "inactive" "$(unit_is sleep-fixture.service)"
 show_state
 
 # 4. start — the switch (nothing else active); state untouched by runtime.
-run_uss "step 4: uss dev start sleep-fixture" 0 "" ""
+run_uss "step 4: start" 0 "" "" dev start sleep-fixture
 check_state "step 4" "$STATE_AFTER_ADD"
 show_state
 
 # 5. status — the running member gets the marker.
-run_uss "step 5: uss ( - Active)" 0 "$OUT_DEV_ACTIVE" ""
+run_uss "step 5: status ( - Active)" 0 "$OUT_DEV_ACTIVE" ""
 assert_eq "step 5: fixture active (live)" "active" "$(unit_is sleep-fixture.service)"
 show_state
 
 # 6. stop.
-run_uss "step 6: uss dev stop sleep-fixture" 0 "" ""
+run_uss "step 6: stop" 0 "" "" dev stop sleep-fixture
 check_state "step 6" "$STATE_AFTER_ADD"
 show_state
 
 # 7. status — marker gone.
-run_uss "step 7: uss (marker gone)" 0 "$OUT_DEV_INACTIVE" ""
+run_uss "step 7: status (marker gone)" 0 "$OUT_DEV_INACTIVE" ""
 show_state
 
 # 8. remove — last member: the group key is deleted, the file persists.
-run_uss "step 8: uss dev remove sleep-fixture" 0 "" ""
+run_uss "step 8: remove" 0 "" "" dev remove sleep-fixture
 check_state "step 8" "$STATE_EMPTY"
 show_state
 
 # 9. status — no groups → no output, exit 0; bootstrap stayed idempotent
 #    (the §8 step-3 byte-compare found the unit current — no rewrite).
-run_uss "step 9: uss (no groups — no output)" 0 "" ""
+run_uss "step 9: status (no groups — no output)" 0 "" ""
 assert_eq "step 9: unit file unchanged (no rewrite)" "$UNIT_HASH_1" \
   "$(sha256sum "$USSD_UNIT" | cut -d' ' -f1)"
