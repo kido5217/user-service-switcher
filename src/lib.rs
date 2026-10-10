@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod core;
+pub mod daemon;
 pub mod error;
 pub mod jobs;
 pub mod names;

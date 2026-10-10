@@ -53,10 +53,14 @@ impl State {
 
     /// Atomic persist (spec §5). Failures map to `internal` (exit 8) —
     /// §4.4 has no dedicated class for state IO mid-command. On a persist
-    /// failure the in-memory `Groups` is ahead of the file: `add` self-heals
-    /// on retry (the no-op re-add re-persists); a `remove` divergence clears
-    /// when ussd next reloads the file. The spec defines no persist-failure
-    /// semantics beyond the exit 8.
+    /// failure the in-memory `Groups` is ahead of the file, and the
+    /// in-memory state is the runtime authority (the daemon never re-reads
+    /// the file at runtime): `add` self-heals on retry (the no-op re-add
+    /// re-persists); a `remove` divergence converges at the next
+    /// successful persist (which rewrites the whole state), but a daemon
+    /// restart before then reloads the stale file and can resurrect the
+    /// removed member. The spec defines no persist-failure semantics
+    /// beyond the exit 8.
     pub fn persist(&self) -> Result<(), Error> {
         self.groups.save(&self.path).map_err(|e| Error::Internal {
             message: e.to_string(),
@@ -1362,11 +1366,11 @@ mod tests {
         use super::*;
         use crate::systemdctl::FakeSystemdCtl;
 
-        async fn setup() -> (FakeSystemdCtl, crate::core::State, u64) {
+        async fn setup(tag: &str) -> (FakeSystemdCtl, crate::core::State, u64) {
             let fake = FakeSystemdCtl::new();
             fake.set_active("a.service"); // member with the queued job
             fake.set_inactive("b.service"); // the target
-            let tmp = Tmp::new("start-conflict");
+            let tmp = Tmp::new(tag);
             let mut state = tmp.state();
             state.groups.add_member("vpn", "a.service");
             state.groups.add_member("vpn", "b.service");
@@ -1376,7 +1380,7 @@ mod tests {
 
         #[tokio::test]
         async fn settles_inactive_satisfies_stop_phase() {
-            let (fake, state, queued) = setup().await;
+            let (fake, state, queued) = setup("conflict-settles-inactive").await;
             let mut book = JobBook::default();
             let result = {
                 let mut fut = Box::pin(start(&fake, "vpn", "b.service", &mut book, &state));
@@ -1417,7 +1421,7 @@ mod tests {
 
         #[tokio::test]
         async fn settles_active_reissues_once_and_succeeds() {
-            let (fake, state, queued) = setup().await;
+            let (fake, state, queued) = setup("conflict-settles-active").await;
             let mut book = JobBook::default();
             let result = {
                 let mut fut = Box::pin(start(&fake, "vpn", "b.service", &mut book, &state));
@@ -1465,7 +1469,7 @@ mod tests {
 
         #[tokio::test]
         async fn rejected_twice_aborts_exit_6_no_start() {
-            let (fake, state, queued) = setup().await;
+            let (fake, state, queued) = setup("conflict-rejected-twice").await;
             let mut book = JobBook::default();
             let result = {
                 let mut fut = Box::pin(start(&fake, "vpn", "b.service", &mut book, &state));
