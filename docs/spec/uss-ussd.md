@@ -212,7 +212,7 @@ WantedBy=default.target
 ## 10. Naming and validation
 
 - **Service names (CLI input):** `foo` → `foo.service`; `foo.service` accepted verbatim; anything else (other suffixes, empty, multiple dots not ending in `.service`) → exit 1 with the usage message. After normalization, a light local unit-name syntax check (no leading `-`, no NUL/whitespace, length ≤ 255) before any D-Bus call.
-- **Loadability check (`add`, and at `start` if not already known):** `GetUnit(name)` → `LoadState`: `loaded`/`stub` → ok; `not-found` → exit 5 (`service <name> not found`); `masked` → exit 5 (`service <name> is masked`).
+- **Loadability check (`add`, and at `start` if not already known):** read the unit's `LoadState` from its canonical unit object (the manager loads the unit on demand): `loaded`/`stub` → ok; `not-found` → exit 5 (`service <name> not found`); `masked` → exit 5 (`service <name> is masked`). _(Erratum 2026-10-11, ticket #20: the original wording was `GetUnit(name)` → `LoadState`. The `Manager.GetUnit` method rejects with `NoSuchUnit` for every unit not currently loaded in the manager — including installed-but-inactive ones (host-grounded, systemd 260) — so it cannot drive this check. Reading properties at the unit object path loads on demand and reports `LoadState` as data.)_
 - **Group names:** non-empty, ≤ 64 bytes, no whitespace, no `/`, no NUL. Group names are local file keys only — no systemd interpretation. Invalid → exit 1.
 - **Normalization everywhere:** storage and all output use the full `*.service` form.
 

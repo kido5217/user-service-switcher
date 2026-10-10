@@ -189,7 +189,12 @@ pub trait SystemdCtl {
     /// for either. No replay.
     fn unit_files_changed(&self) -> broadcast::Receiver<()>;
 
-    /// One unit's live state (`GetUnit` + properties, spec §3).
+    /// One unit's live state (the unit object's properties, spec §3).
+    /// A missing unit is DATA here — `not-found`/`inactive` — not an
+    /// error (spec §10's loadability check builds on it). The real
+    /// backend grounds the mechanism: properties read at the canonical
+    /// unit object path (which loads on demand), never the `GetUnit`
+    /// method (it rejects for installed-but-unloaded units).
     async fn get_unit_state(&self, unit: &str) -> Result<UnitState, CtlError>;
 
     /// Batched live state for re-sync (spec §3/§7): all requested units,
