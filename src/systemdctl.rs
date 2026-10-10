@@ -181,6 +181,13 @@ pub trait SystemdCtl {
     /// (spec §7). No replay.
     fn unit_state_changed(&self) -> broadcast::Receiver<UnitStateChanged>;
 
+    /// A receiver for unit-file change events (spec §7): the manager's
+    /// `UnitFilesChanged` signal and a unit's `Reloading` property
+    /// dropping to `false` (a reload finished). Payload-free: the
+    /// watchdog's reaction (re-validate member unit files) is the same
+    /// for either. No replay.
+    fn unit_files_changed(&self) -> broadcast::Receiver<()>;
+
     /// One unit's live state (`GetUnit` + properties, spec §3).
     async fn get_unit_state(&self, unit: &str) -> Result<UnitState, CtlError>;
 
@@ -249,6 +256,7 @@ pub struct FakeSystemdCtl {
     inner: Mutex<Inner>,
     job_removed_tx: broadcast::Sender<JobRemoved>,
     state_changed_tx: broadcast::Sender<UnitStateChanged>,
+    files_changed_tx: broadcast::Sender<()>,
 }
 
 impl Default for FakeSystemdCtl {
@@ -261,10 +269,12 @@ impl FakeSystemdCtl {
     pub fn new() -> Self {
         let (job_removed_tx, _) = broadcast::channel(SIGNAL_CAPACITY);
         let (state_changed_tx, _) = broadcast::channel(SIGNAL_CAPACITY);
+        let (files_changed_tx, _) = broadcast::channel(SIGNAL_CAPACITY);
         Self {
             inner: Mutex::new(Inner::default()),
             job_removed_tx,
             state_changed_tx,
+            files_changed_tx,
         }
     }
 
@@ -409,6 +419,19 @@ impl FakeSystemdCtl {
             .insert(unit.to_owned(), state.to_owned());
     }
 
+    /// Manually push a unit-file change event (watchdog testing, spec
+    /// §7): stands in for `UnitFilesChanged` / a unit's `Reloading(false)`.
+    pub fn emit_files_changed(&self) {
+        let _ = self.files_changed_tx.send(());
+    }
+
+    /// Simulate a bus reconnect (spec §7 re-sync testing): the
+    /// per-connection subscription is gone — `subscribe` must run again
+    /// before signal reactions re-enable.
+    pub fn reset_connection(&self) {
+        self.inner.lock().unwrap().subscribed = false;
+    }
+
     /// Whether `subscribe` has been called (test introspection).
     pub fn is_subscribed(&self) -> bool {
         self.inner.lock().unwrap().subscribed
@@ -471,6 +494,10 @@ impl SystemdCtl for FakeSystemdCtl {
 
     fn unit_state_changed(&self) -> broadcast::Receiver<UnitStateChanged> {
         self.state_changed_tx.subscribe()
+    }
+
+    fn unit_files_changed(&self) -> broadcast::Receiver<()> {
+        self.files_changed_tx.subscribe()
     }
 
     async fn get_unit_state(&self, unit: &str) -> Result<UnitState, CtlError> {

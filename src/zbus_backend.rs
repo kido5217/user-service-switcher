@@ -48,8 +48,10 @@
 //!
 //! # Signal pumps are loss-free by construction
 //!
-//! One pump task per connection forwards every `JobRemoved` and every
-//! unit `PropertiesChanged` edge onto the seam's broadcast channels. The
+//! One pump task per connection forwards every `JobRemoved`, every unit
+//! `PropertiesChanged` edge, and every unit-file change (the manager's
+//! `UnitFilesChanged` plus a unit's `Reloading` property dropping to
+//! `false`) onto the seam's broadcast channels. The
 //! pump loop never exits on a bad message (skip + continue), and D-Bus
 //! applies broker-side backpressure when the per-match queue fills — so
 //! delivery stalls rather than drops. Receiver lag still drops *the lagging
@@ -235,6 +237,7 @@ pub struct ZbusCtl {
     state: Mutex<Option<Shared>>,
     job_tx: broadcast::Sender<JobRemoved>,
     state_tx: broadcast::Sender<UnitStateChanged>,
+    files_tx: broadcast::Sender<()>,
     /// Fires when the current connection closes; `lost_now` lets a caller
     /// that arrives after the fact see it immediately.
     lost: Arc<Notify>,
@@ -251,10 +254,12 @@ impl ZbusCtl {
     pub fn new() -> Self {
         let (job_tx, _) = broadcast::channel(SIGNAL_CAPACITY);
         let (state_tx, _) = broadcast::channel(SIGNAL_CAPACITY);
+        let (files_tx, _) = broadcast::channel(SIGNAL_CAPACITY);
         Self {
             state: Mutex::new(None),
             job_tx,
             state_tx,
+            files_tx,
             lost: Arc::new(Notify::new()),
             lost_now: Arc::new(AtomicBool::new(false)),
         }
@@ -323,6 +328,7 @@ impl ZbusCtl {
             conn,
             self.job_tx.clone(),
             self.state_tx.clone(),
+            self.files_tx.clone(),
             self.lost.clone(),
             self.lost_now.clone(),
         ));
@@ -349,13 +355,15 @@ impl ZbusCtl {
     }
 }
 
-/// Forward both signal streams for one connection; ends when both streams
-/// end (streams only end when the connection closes — per-message problems
-/// are skipped inside the loops), which is the connection-lost event.
+/// Forward the three signal streams for one connection; ends when all
+/// streams end (streams only end when the connection closes —
+/// per-message problems are skipped inside the loops), which is the
+/// connection-lost event.
 async fn run_pumps(
     conn: Connection,
     job_tx: broadcast::Sender<JobRemoved>,
     state_tx: broadcast::Sender<UnitStateChanged>,
+    files_tx: broadcast::Sender<()>,
     lost: Arc<Notify>,
     lost_now: Arc<AtomicBool>,
 ) {
@@ -367,9 +375,10 @@ async fn run_pumps(
             return;
         }
     };
-    let job_pump = pump_job_removed(manager, job_tx);
-    let props_pump = pump_properties_changed(conn, state_tx);
-    tokio::join!(job_pump, props_pump);
+    let job_pump = pump_job_removed(manager.clone(), job_tx);
+    let props_pump = pump_properties_changed(conn, state_tx, files_tx.clone());
+    let files_pump = pump_unit_files_changed(manager, files_tx);
+    tokio::join!(job_pump, props_pump, files_pump);
     lost_now.store(true, Ordering::Release);
     lost.notify_waiters();
 }
@@ -394,11 +403,17 @@ async fn pump_job_removed(manager: ManagerProxy<'static>, tx: broadcast::Sender<
 }
 
 /// Unit `ActiveState` `PropertiesChanged` edges → the seam channel
-/// (spec §7). Only unit objects under `/org/freedesktop/systemd1/unit/`
-/// and only the `org.freedesktop.systemd1.Unit` interface (where
-/// `ActiveState` is declared); an invalidated (value-less) `ActiveState`
-/// is re-read so the edge still carries a state.
-async fn pump_properties_changed(conn: Connection, tx: broadcast::Sender<UnitStateChanged>) {
+/// (spec §7), and a unit's `Reloading` property dropping to `false`
+/// (a reload finished) → the unit-file-change channel (spec §7). Only
+/// unit objects under `/org/freedesktop/systemd1/unit/` and only the
+/// `org.freedesktop.systemd1.Unit` interface (where `ActiveState` is
+/// declared); an invalidated (value-less) `ActiveState` is re-read so the
+/// edge still carries a state.
+async fn pump_properties_changed(
+    conn: Connection,
+    tx: broadcast::Sender<UnitStateChanged>,
+    files_tx: broadcast::Sender<()>,
+) {
     let Ok(rule) = MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
         .sender(MANAGER)
@@ -433,14 +448,28 @@ async fn pump_properties_changed(conn: Connection, tx: broadcast::Sender<UnitSta
         let Some(unit) = unit_name_from_dbus_path(path) else {
             continue;
         };
+        // A single `PropertiesChanged` may carry several properties
+        // (systemd coalesces changes per unit) — so `ActiveState` and
+        // `Reloading` in the same signal are BOTH handled, not
+        // early-continued after the first (review, 2026-10-10): a reload
+        // finishing in the same manager iteration as a state transition
+        // must not lose the `Reloading(false)` event.
+        if changed
+            .get("Reloading")
+            .and_then(|v| v.downcast_ref::<bool>().ok())
+            == Some(false)
+        {
+            // A unit reload finished — the watchdog re-validates member
+            // unit files (spec §7).
+            let _ = files_tx.send(());
+        }
         if let Some(value) = changed.get("ActiveState") {
             if let Ok(state) = value.downcast_ref::<&str>() {
                 let _ = tx.send(UnitStateChanged {
-                    unit,
+                    unit: unit.clone(),
                     active_state: active_state_from_wire(state),
                 });
             }
-            continue;
         }
         if invalidated.iter().any(|p| p == "ActiveState") {
             // Value invalidated without a new value: re-read so the edge
@@ -470,6 +499,31 @@ async fn pump_properties_changed(conn: Connection, tx: broadcast::Sender<UnitSta
                 }
             });
         }
+    }
+}
+
+/// The manager's `UnitFilesChanged` signal → the unit-file-change channel
+/// (spec §7) — unit files changed on disk: the watchdog re-validates
+/// member unit files (newly masked/removed).
+async fn pump_unit_files_changed(manager: ManagerProxy<'static>, tx: broadcast::Sender<()>) {
+    let Ok(rule) = MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender(MANAGER)
+        .and_then(|b| b.interface("org.freedesktop.systemd1.Manager"))
+        .and_then(|b| b.member("UnitFilesChanged"))
+        .map(|b| b.build())
+    else {
+        return;
+    };
+    let Ok(mut stream) =
+        MessageStream::for_match_rule(rule, manager.inner().connection(), Some(SIGNAL_CAPACITY))
+            .await
+    else {
+        return;
+    };
+    while let Some(msg) = stream.next().await {
+        let Ok(_) = msg else { continue }; // bad message: skip, keep pumping
+        let _ = tx.send(());
     }
 }
 
@@ -507,6 +561,10 @@ impl SystemdCtl for ZbusCtl {
 
     fn unit_state_changed(&self) -> broadcast::Receiver<UnitStateChanged> {
         self.state_tx.subscribe()
+    }
+
+    fn unit_files_changed(&self) -> broadcast::Receiver<()> {
+        self.files_tx.subscribe()
     }
 
     async fn get_unit_state(&self, unit: &str) -> Result<UnitState, CtlError> {

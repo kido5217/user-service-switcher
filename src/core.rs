@@ -472,7 +472,7 @@ fn map_op_error(e: CtlError, op: OpVerb, service: &str) -> Error {
 
 /// A state query failed (not a start/stop operation): no §4.4 row fits —
 /// `daemon internal` (exit 8) with the reason in the message.
-fn map_query_error(e: CtlError) -> Error {
+pub(crate) fn map_query_error(e: CtlError) -> Error {
     match e {
         CtlError::Rejected { name, message } => Error::Internal {
             message: format!("systemd rejected the query: {name} ({message})"),
