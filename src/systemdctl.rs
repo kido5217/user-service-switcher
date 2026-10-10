@@ -20,9 +20,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 
 /// The job result strings systemd reports in `JobRemoved` (spec §3).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,6 +208,13 @@ pub trait SystemdCtl {
     /// `Manager.EnableUnitFiles(units, runtime=false, force=true)`
     /// (bootstrap step 3, spec §8) — persistent symlinks.
     async fn enable_unit_files(&self, units: &[String]) -> Result<(), CtlError>;
+
+    /// Resolves when the live connection has been dropped — the daemon's
+    /// (spec §6) reconnect trigger: backoff → `connect` → `subscribe` →
+    /// re-sync before signal reactions re-enable. If never connected,
+    /// waits for the first connection to establish and then drop. A drop
+    /// that already happened resolves immediately.
+    async fn connection_lost(&self);
 }
 
 /// Signal channel capacity. Comfortably above any realistic in-flight batch;
@@ -227,6 +235,9 @@ struct Inner {
     unit_file_states: HashMap<String, String>,
     next_job_id: u64,
     subscribed: bool,
+    /// `connect` result override (test: manager-death simulation); `None`
+    /// = the default `Ok(())`.
+    connect_result: Option<Result<(), CtlError>>,
 }
 
 impl Inner {
@@ -257,6 +268,10 @@ pub struct FakeSystemdCtl {
     job_removed_tx: broadcast::Sender<JobRemoved>,
     state_changed_tx: broadcast::Sender<UnitStateChanged>,
     files_changed_tx: broadcast::Sender<()>,
+    /// Liveness (spec §6 daemon reconnect): set + notified by
+    /// [`FakeSystemdCtl::simulate_bus_drop`]; cleared by `connect`.
+    dead: Arc<Notify>,
+    dead_now: Arc<AtomicBool>,
 }
 
 impl Default for FakeSystemdCtl {
@@ -275,7 +290,25 @@ impl FakeSystemdCtl {
             job_removed_tx,
             state_changed_tx,
             files_changed_tx,
+            dead: Arc::new(Notify::new()),
+            dead_now: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Make `connect` return the given result on every attempt (test:
+    /// manager-death simulation); `None` restores the default `Ok(())`.
+    pub fn set_connect_result(&self, result: Option<Result<(), CtlError>>) {
+        self.inner.lock().unwrap().connect_result = result;
+    }
+
+    /// Simulate a bus drop (spec §6 daemon reconnect testing): the
+    /// liveness flag is set and `connection_lost` waiters wake. The
+    /// fake's signal channels stay alive (a reconnect re-subscribes to
+    /// the same channels — the real backend's channels are per-connection,
+    /// but the daemon code path is identical).
+    pub fn simulate_bus_drop(&self) {
+        self.dead_now.store(true, Ordering::Release);
+        self.dead.notify_waiters();
     }
 
     // -- manual unit state injection (test API) -----------------------------
@@ -440,7 +473,18 @@ impl FakeSystemdCtl {
 
 impl SystemdCtl for FakeSystemdCtl {
     async fn connect(&self) -> Result<(), CtlError> {
-        Ok(())
+        let result = self
+            .inner
+            .lock()
+            .unwrap()
+            .connect_result
+            .clone()
+            .unwrap_or(Ok(()));
+        if result.is_ok() {
+            // A (re)connect establishes a live connection.
+            self.dead_now.store(false, Ordering::Release);
+        }
+        result
     }
 
     async fn subscribe(&self) -> Result<(), CtlError> {
@@ -498,6 +542,15 @@ impl SystemdCtl for FakeSystemdCtl {
 
     fn unit_files_changed(&self) -> broadcast::Receiver<()> {
         self.files_changed_tx.subscribe()
+    }
+
+    async fn connection_lost(&self) {
+        let mut notified = std::pin::pin!(self.dead.notified());
+        notified.as_mut().enable(); // register before the check (no permit)
+        if self.dead_now.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
     }
 
     async fn get_unit_state(&self, unit: &str) -> Result<UnitState, CtlError> {

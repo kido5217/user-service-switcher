@@ -129,6 +129,19 @@ impl Response {
         }
     }
 
+    /// A successful mutation response (`add`/`remove`/`start`/`stop`):
+    /// `ok` with no `result` payload (`{"v":1,"id":<id>,"ok":true}`).
+    pub fn ok_empty(id: u64) -> Self {
+        Self {
+            v: PROTOCOL_VERSION,
+            id,
+            ok: true,
+            result: None,
+            error: None,
+            message: None,
+        }
+    }
+
     /// An error response: stable code + human-readable message, safe to
     /// print verbatim.
     pub fn err(id: u64, error: ErrorCode, message: impl Into<String>) -> Self {

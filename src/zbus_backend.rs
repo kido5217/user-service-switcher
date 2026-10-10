@@ -68,14 +68,21 @@
 //! # Reconnect is runtime-orchestrated (ticket #13 decision)
 //!
 //! The backend does not reconnect on its own: calls on a dead connection
-//! return [`CtlError::ManagerAbsent`], [`ZbusCtl::connection_lost`]
-//! notifies when the connection drops, and `connect()` re-establishes
-//! (re-spawning pumps) — the ussd runtime adds backoff and drives the
+//! return [`CtlError::ManagerAbsent`], the seam's `connection_lost` (impl
+//! on this type) notifies when the connection drops, and `connect()`
+//! re-establishes (re-spawning pumps) — it also re-verifies the manager
+//! name on a still-open connection and abandons one whose manager died.
+//! Method calls carry a 30 s timeout (`METHOD_TIMEOUT`, review
+//! 2026-10-10): a wedged-but-alive manager fails its calls with a
+//! `timeout` rejection instead of freezing the single-task daemon. The
+//! ussd runtime adds backoff and drives the
 //! `subscribe` + `list_states` re-sync (spec §3: re-sync is mandatory).
 
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use tokio::sync::{Mutex, Notify, broadcast};
@@ -102,6 +109,12 @@ pub const ERR_FILE_NOT_FOUND: &str = "org.freedesktop.DBus.Error.FileNotFound";
 
 const MANAGER: &str = "org.freedesktop.systemd1";
 const UNIT_PATH_PREFIX: &str = "/org/freedesktop/systemd1/unit/";
+/// Method-call timeout (review, 2026-10-10): a wedged-but-alive manager
+/// must not freeze the daemon — the daemon is a single task, and a
+/// method call awaiting its reply forever would freeze the command loop
+/// (and SIGTERM handling with it). zbus defaults to no timeout; with
+/// this one, a stalled call fails with a `timeout` rejection instead.
+const METHOD_TIMEOUT: Duration = Duration::from_secs(30);
 /// Per-receiver and per-pump-channel capacity (same as the fake's). The
 /// pump consumes without blocking beyond the `send`, so real queues stay
 /// shallow; overflow means a receiver was far behind and must re-sync.
@@ -203,6 +216,13 @@ fn map_call_error(err: zbus::Error) -> CtlError {
             name: name.to_string(),
             message: message.unwrap_or_default(),
         },
+        // A method call that got no reply within `METHOD_TIMEOUT` — the
+        // manager is alive (name owned, socket open) but not responding;
+        // fail the call instead of freezing the caller.
+        zbus::Error::InputOutput(err) if err.kind() == ErrorKind::TimedOut => CtlError::Rejected {
+            name: "timeout".into(),
+            message: format!("no reply from the user manager within {METHOD_TIMEOUT:?}"),
+        },
         _ => CtlError::ManagerAbsent,
     }
 }
@@ -227,6 +247,9 @@ fn remap_stop_rejection(unit: &str, err: CtlError) -> CtlError {
 /// The live connection state; replaced wholesale on (re)connect.
 #[derive(Debug)]
 struct Shared {
+    /// A handle kept for abandoning the connection (a still-open socket
+    /// whose manager name is gone — see `install`'s liveness check).
+    conn: Connection,
     manager: ManagerProxy<'static>,
     pumps: tokio::task::JoinHandle<()>,
 }
@@ -265,22 +288,6 @@ impl ZbusCtl {
         }
     }
 
-    /// Resolves when the live connection has dropped (spec §3: the runtime
-    /// reacts with backoff → `connect` → `subscribe` → state re-sync).
-    /// A drop that already happened (since the last `connect`) returns
-    /// immediately; if never connected, waits for the first connection to
-    /// establish and then drop. Registers the waiter *before* consulting
-    /// the flag, so a drop racing this call cannot be missed
-    /// (`notify_waiters` stores no permit).
-    pub async fn connection_lost(&self) {
-        let mut notified = std::pin::pin!(self.lost.notified());
-        notified.as_mut().enable(); // register now, consume permit on await
-        if self.lost_now.load(Ordering::Acquire) {
-            return;
-        }
-        notified.await;
-    }
-
     /// The current live manager proxy, or `ManagerAbsent` when there is no
     /// connection or it died (no silent reconnect here — see module docs).
     async fn manager(&self) -> Result<ManagerProxy<'static>, CtlError> {
@@ -296,17 +303,33 @@ impl ZbusCtl {
     /// Establish the connection from a finished bus-connect attempt:
     /// absent user manager (bus unreachable, or `org.freedesktop.systemd1`
     /// nameless on it) → `ManagerAbsent` (spec §3 environment edge, §8
-    /// step 1). Idempotent: an already-live connection is kept. Installs
-    /// the signal pumps for the new connection and retires the old task.
+    /// step 1). Idempotent: an already-live connection is kept — but only
+    /// while the manager name is still owned on it: a still-open socket
+    /// whose manager DIED (the name vanishes without the connection
+    /// closing) is abandoned — the socket is closed, the pumps retire,
+    /// and the new connection attempt re-checks the name. Installs the
+    /// signal pumps for the new connection and retires the old task.
     async fn install(&self, conn: Result<Connection, zbus::Error>) -> Result<(), CtlError> {
         let mut state = self.state.lock().await;
-        if let Some(shared) = state.as_ref() {
-            if !shared.manager.inner().connection().is_closed() {
-                // Live connection kept; a stale `lost_now` (a pump that
-                // exited while its connection was replaced) must not latch.
+        if let Some(shared) = state.take() {
+            let existing = shared.manager.inner().connection();
+            let manager_gone = existing.is_closed() || !manager_name_owned(existing).await;
+            if !manager_gone {
+                // Live connection with the manager present; a stale
+                // `lost_now` (a pump that exited while its connection was
+                // replaced) must not latch.
+                state.replace(shared);
                 self.lost_now.store(false, Ordering::Release);
                 return Ok(());
             }
+            // Abandon: closing the socket ends the pumps' streams (their
+            // `run_pumps` join completes and raises the lost event); abort
+            // + await prove the old pumps are dead before the new
+            // connection installs and clears `lost_now`. `state` stays
+            // taken; the new connection is installed below.
+            let _ = shared.conn.close().await;
+            shared.pumps.abort();
+            let _ = shared.pumps.await;
         }
         let conn = conn.map_err(|_| CtlError::ManagerAbsent)?;
         let dbus = zbus::fdo::DBusProxy::new(&conn)
@@ -324,6 +347,7 @@ impl ZbusCtl {
         let manager = ManagerProxy::new(&conn)
             .await
             .map_err(|_| CtlError::ManagerAbsent)?;
+        let conn_handle = conn.clone();
         let pumps = tokio::spawn(run_pumps(
             conn,
             self.job_tx.clone(),
@@ -332,7 +356,11 @@ impl ZbusCtl {
             self.lost.clone(),
             self.lost_now.clone(),
         ));
-        if let Some(old) = state.replace(Shared { manager, pumps }) {
+        if let Some(old) = state.replace(Shared {
+            conn: conn_handle,
+            manager,
+            pumps,
+        }) {
             // Retire the old pumps BEFORE clearing `lost_now`: a pump
             // mid-poll sets the flag in its final poll and `abort`
             // cannot preempt one; awaiting the handle proves it is dead,
@@ -353,6 +381,20 @@ impl ZbusCtl {
             .map_err(map_call_error)?;
         Ok(JobHandle { id: id as u64 })
     }
+}
+
+/// Whether the manager name is still owned on a (live) connection
+/// (`org.freedesktop.systemd1` → bus name lookup). `false` on any error
+/// — conservative: an unverifiable manager is treated as gone (the
+/// reconnect sequence re-checks).
+async fn manager_name_owned(conn: &Connection) -> bool {
+    let Ok(dbus) = zbus::fdo::DBusProxy::new(conn).await else {
+        return false;
+    };
+    let Ok(name) = zbus::names::BusName::try_from(MANAGER) else {
+        return false; // infallible constant
+    };
+    dbus.name_has_owner(name).await.unwrap_or(false)
 }
 
 /// Forward the three signal streams for one connection; ends when all
@@ -529,7 +571,11 @@ async fn pump_unit_files_changed(manager: ManagerProxy<'static>, tx: broadcast::
 
 impl SystemdCtl for ZbusCtl {
     async fn connect(&self) -> Result<(), CtlError> {
-        self.install(Connection::session().await).await
+        // `method_timeout` (module docs): the default is no timeout, and a
+        // wedged manager would then freeze the single-task daemon.
+        let builder = zbus::connection::Builder::session().map_err(|_| CtlError::ManagerAbsent)?;
+        self.install(builder.method_timeout(METHOD_TIMEOUT).build().await)
+            .await
     }
 
     async fn subscribe(&self) -> Result<(), CtlError> {
@@ -565,6 +611,22 @@ impl SystemdCtl for ZbusCtl {
 
     fn unit_files_changed(&self) -> broadcast::Receiver<()> {
         self.files_tx.subscribe()
+    }
+
+    /// The seam's liveness primitive (spec §6 daemon reconnect trigger):
+    /// resolves when the live connection has dropped. A drop that already
+    /// happened (since the last `connect`) returns immediately; if never
+    /// connected, waits for the first connection to establish and then
+    /// drop. Registers the waiter *before* consulting the flag, so a drop
+    /// racing this call cannot be missed (`notify_waiters` stores no
+    /// permit).
+    async fn connection_lost(&self) {
+        let mut notified = std::pin::pin!(self.lost.notified());
+        notified.as_mut().enable(); // register now, consume permit on await
+        if self.lost_now.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
     }
 
     async fn get_unit_state(&self, unit: &str) -> Result<UnitState, CtlError> {
