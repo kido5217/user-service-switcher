@@ -9,6 +9,7 @@
 
 pub mod core;
 pub mod error;
+pub mod jobs;
 pub mod names;
 pub mod protocol;
 pub mod state;
