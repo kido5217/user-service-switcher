@@ -14,6 +14,7 @@ pub mod names;
 pub mod protocol;
 pub mod state;
 pub mod systemdctl;
+pub mod watchdog;
 pub mod zbus_backend;
 
 pub use error::{Error, ErrorCode, OpError, OpVerb};
