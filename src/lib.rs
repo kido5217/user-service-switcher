@@ -15,6 +15,7 @@ pub mod names;
 pub mod protocol;
 pub mod state;
 pub mod systemdctl;
+pub mod uss_client;
 pub mod watchdog;
 pub mod zbus_backend;
 

@@ -45,6 +45,19 @@ impl ErrorCode {
             ErrorCode::Internal => "internal",
         }
     }
+
+    /// The §4.4 exit code for a daemon-reported error (§6 carries the
+    /// code, not the exit; uss maps it here).
+    pub fn exit_code(self) -> i32 {
+        match self {
+            ErrorCode::UnknownGroup => 2,
+            ErrorCode::NotAMember => 3,
+            ErrorCode::ServiceInOtherGroup => 4,
+            ErrorCode::UnitNotLoadable | ErrorCode::UnitMasked => 5,
+            ErrorCode::OpFailed => 6,
+            ErrorCode::Protocol | ErrorCode::Internal => 8,
+        }
+    }
 }
 
 impl fmt::Display for ErrorCode {
@@ -108,6 +121,12 @@ pub enum Error {
     #[error("invalid group name: '{input}'")]
     InvalidGroupName { input: String },
 
+    /// Exit 1 — a usage shape clap can't express (the verb/service
+    /// pairing; names are validated with the dedicated variants).
+    /// Client-side, before any socket traffic.
+    #[error("{message}")]
+    Usage { message: String },
+
     /// Exit 2 — any command naming a group that does not exist.
     #[error("no such group: {group}")]
     UnknownGroup { group: String },
@@ -155,13 +174,21 @@ pub enum Error {
     /// Exit 8 — unexpected internal error.
     #[error("daemon error: {message}")]
     Internal { message: String },
+
+    /// An error reported by the daemon (§6): stable code + a message safe
+    /// to print verbatim. The exit code comes from the code's §4.4 row
+    /// (the wire carries no exit code); the message is printed as-is.
+    #[error("{message}")]
+    DaemonReported { code: ErrorCode, message: String },
 }
 
 impl Error {
     /// The §4.4 exit code for this error.
     pub fn exit_code(&self) -> i32 {
         match self {
-            Error::InvalidServiceName { .. } | Error::InvalidGroupName { .. } => 1,
+            Error::InvalidServiceName { .. }
+            | Error::InvalidGroupName { .. }
+            | Error::Usage { .. } => 1,
             Error::UnknownGroup { .. } => 2,
             Error::NotAMember { .. } => 3,
             Error::ServiceInOtherGroup { .. } => 4,
@@ -172,6 +199,7 @@ impl Error {
             | Error::UssdFailedToStart
             | Error::UssdUnavailable { .. } => 7,
             Error::Protocol { .. } | Error::Internal { .. } => 8,
+            Error::DaemonReported { code, .. } => code.exit_code(),
         }
     }
 
@@ -187,8 +215,10 @@ impl Error {
             Error::OpFailed(_) => Some(ErrorCode::OpFailed),
             Error::Protocol { .. } => Some(ErrorCode::Protocol),
             Error::Internal { .. } => Some(ErrorCode::Internal),
+            Error::DaemonReported { code, .. } => Some(*code),
             Error::InvalidServiceName { .. }
             | Error::InvalidGroupName { .. }
+            | Error::Usage { .. }
             | Error::UserManagerAbsent { .. }
             | Error::UssdBinaryNotFound
             | Error::UssdFailedToStart
@@ -202,7 +232,7 @@ mod tests {
     use super::*;
 
     /// Every §4.4 row: (error, exit code, protocol code, exact message).
-    fn table() -> [(Error, i32, Option<ErrorCode>, &'static str); 16] {
+    fn table() -> [(Error, i32, Option<ErrorCode>, &'static str); 18] {
         [
             (
                 Error::InvalidServiceName {
@@ -335,6 +365,26 @@ mod tests {
                 Some(ErrorCode::Internal),
                 "daemon error: boom",
             ),
+            // A daemon-reported error (§6): the exit code comes from the
+            // wire code's §4.4 row; the message is printed verbatim.
+            (
+                Error::DaemonReported {
+                    code: ErrorCode::NotAMember,
+                    message: "foo.service is not in group vpn".into(),
+                },
+                3,
+                Some(ErrorCode::NotAMember),
+                "foo.service is not in group vpn",
+            ),
+            // A usage shape clap can't express (client-side, exit 1).
+            (
+                Error::Usage {
+                    message: "a service is required (usage: uss vpn add <service>)".into(),
+                },
+                1,
+                None,
+                "a service is required (usage: uss vpn add <service>)",
+            ),
         ]
     }
 
@@ -344,6 +394,22 @@ mod tests {
             assert_eq!(err.exit_code(), exit, "exit code for {err:?}");
             assert_eq!(err.code(), code, "protocol code for {err:?}");
             assert_eq!(&err.to_string(), message, "message for {err:?}");
+        }
+    }
+
+    #[test]
+    fn wire_codes_map_to_their_4_4_exit_rows() {
+        for (code, exit) in [
+            (ErrorCode::UnknownGroup, 2),
+            (ErrorCode::NotAMember, 3),
+            (ErrorCode::ServiceInOtherGroup, 4),
+            (ErrorCode::UnitNotLoadable, 5),
+            (ErrorCode::UnitMasked, 5),
+            (ErrorCode::OpFailed, 6),
+            (ErrorCode::Protocol, 8),
+            (ErrorCode::Internal, 8),
+        ] {
+            assert_eq!(code.exit_code(), exit, "{code:?}");
         }
     }
 
