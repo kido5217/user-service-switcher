@@ -117,7 +117,7 @@ pub struct UnitStateChanged {
 }
 
 /// Errors the seam can report.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum CtlError {
     /// No user manager on the session bus (bootstrap → exit 7, §4.4).
     #[error("user manager not running")]
@@ -189,9 +189,9 @@ pub trait SystemdCtl {
     async fn list_states(&self, units: &[String]) -> Result<Vec<(String, UnitState)>, CtlError>;
 
     /// `GetUnitFileState(unit)` (bootstrap step 3, spec §8): the unit file's
-    /// state string (`enabled`, `disabled`, `masked`, …). An unknown unit is
-    /// rejected with a structured error (the real backend maps systemd's —
-    /// slice 7 grounds it).
+    /// state string (`enabled`, `disabled`, `masked`, …). An unknown file
+    /// rejects with `org.freedesktop.DBus.Error.FileNotFound` (the real
+    /// backend's name, host-grounded by the zbus-backend slice).
     async fn get_unit_file_state(&self, unit: &str) -> Result<String, CtlError>;
 
     /// `Manager.Reload()` (bootstrap step 3, spec §8) — synchronous reply.
@@ -508,8 +508,8 @@ impl SystemdCtl for FakeSystemdCtl {
             .get(unit)
             .cloned()
             .ok_or(CtlError::Rejected {
-                name: "org.freedesktop.systemd1.NoSuchUnit".into(),
-                message: format!("Unit {unit} does not exist."),
+                name: "org.freedesktop.DBus.Error.FileNotFound".into(),
+                message: "No such file or directory".into(),
             })
     }
 
@@ -799,7 +799,7 @@ mod tests {
             CtlError::Rejected {
                 ref name,
                 ..
-            } if name.ends_with("NoSuchUnit")
+            } if name.ends_with("FileNotFound")
         ));
     }
 

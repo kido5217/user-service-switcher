@@ -9,7 +9,9 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "sync"] }
+# Signal pumps consume zbus streams via StreamExt (spec §12: pure Rust).
+futures-util = "0.3"
 # zbus 5.x: tokio async runtime (default features off — no async-io, no blocking API).
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 # zbus_systemd: systemd1 proxies; its `zbus-async-tokio` feature forwards to `zbus/tokio`.
