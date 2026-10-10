@@ -238,6 +238,10 @@ struct Inner {
     /// `connect` result override (test: manager-death simulation); `None`
     /// = the default `Ok(())`.
     connect_result: Option<Result<(), CtlError>>,
+    /// `reload()` call count (bootstrap idempotency testing, spec §8).
+    reloads: usize,
+    /// `enable_unit_files` call log (bootstrap idempotency testing).
+    enable_calls: Vec<Vec<String>>,
 }
 
 impl Inner {
@@ -452,6 +456,16 @@ impl FakeSystemdCtl {
             .insert(unit.to_owned(), state.to_owned());
     }
 
+    /// `reload()` call count (bootstrap idempotency testing, spec §8).
+    pub fn reloads(&self) -> usize {
+        self.inner.lock().unwrap().reloads
+    }
+
+    /// `enable_unit_files` call log (bootstrap idempotency testing).
+    pub fn enable_calls(&self) -> Vec<Vec<String>> {
+        self.inner.lock().unwrap().enable_calls.clone()
+    }
+
     /// Manually push a unit-file change event (watchdog testing, spec
     /// §7): stands in for `UnitFilesChanged` / a unit's `Reloading(false)`.
     pub fn emit_files_changed(&self) {
@@ -594,10 +608,12 @@ impl SystemdCtl for FakeSystemdCtl {
     }
 
     async fn reload(&self) -> Result<(), CtlError> {
+        self.inner.lock().unwrap().reloads += 1;
         Ok(())
     }
 
-    async fn enable_unit_files(&self, _units: &[String]) -> Result<(), CtlError> {
+    async fn enable_unit_files(&self, units: &[String]) -> Result<(), CtlError> {
+        self.inner.lock().unwrap().enable_calls.push(units.to_vec());
         Ok(())
     }
 }
