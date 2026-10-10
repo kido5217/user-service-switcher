@@ -99,6 +99,10 @@ for bin in jq systemctl sha256sum; do
   command -v "$bin" >/dev/null || { echo "FATAL: $bin not on PATH" >&2; exit 2; }
 done
 [ -x "$USS" ] && [ -x "$USSD" ] || { echo "FATAL: $USS / $USSD missing — run cargo build first" >&2; exit 2; }
+# cargo test alone does not re-link the plain bin executables — refuse to
+# run a stale build (it would "test" the wrong code, ticket #20 lesson).
+NEWEST_SRC="$(find "$REPO/src" "$REPO/Cargo.toml" -newer "$USS" -print -quit 2>/dev/null)"
+[ -n "$NEWEST_SRC" ] && { echo "FATAL: $USS is stale ($NEWEST_SRC is newer) — run cargo build" >&2; exit 2; }
 USSD_ABS="$(readlink -f "$USSD")"
 
 SLEEP_BIN=""
