@@ -384,7 +384,7 @@ impl ZbusCtl {
             .await
             .map_err(|_| CtlError::ManagerAbsent)?;
         let conn_handle = conn.clone();
-        let (ready_tx, ready_rx) = oneshot::channel();
+        let (ready_tx, ready_rx) = oneshot::channel::<bool>();
         let pumps = tokio::spawn(run_pumps(
             conn,
             self.job_tx.clone(),
@@ -400,13 +400,26 @@ impl ZbusCtl {
         // The pump fires `ready` on every exit path, and its match
         // round-trips inherit the connection's 30 s method timeout — this
         // await is bounded.
-        if ready_rx.await.is_err() {
-            // The pump task dropped `ready_tx` (aborted): abandon the
-            // connection like the stale-connection path above.
-            let _ = conn_handle.close().await;
-            pumps.abort();
-            let _ = pumps.await;
-            return Err(CtlError::ManagerAbsent);
+        let install_ok = match ready_rx.await {
+            Ok(install_ok) => install_ok,
+            Err(_) => {
+                // The pump task dropped `ready_tx` (aborted): abandon the
+                // connection like the stale-connection path above.
+                let _ = conn_handle.close().await;
+                pumps.abort();
+                let _ = pumps.await;
+                return Err(CtlError::ManagerAbsent);
+            }
+        };
+        if !install_ok {
+            // The new pump's broker match install failed: the pump set the
+            // lost flag and notified before firing `ready` (`finish_pumps`)
+            // — but this `install` holds the mutex and the daemon is inside
+            // `connect()`, so no `connection_lost()` waiter was registered
+            // to receive that notify. KEEP the flag: the next
+            // `connection_lost()` read fires immediately -> BusDrop -> the
+            // daemon's reconnect (re-subscribe + re-sync, spec §3/§7)
+            // covers the gap.
         }
         if let Some(old) = state.replace(Shared {
             conn: conn_handle,
@@ -420,7 +433,9 @@ impl ZbusCtl {
             old.pumps.abort();
             let _ = old.pumps.await;
         }
-        self.lost_now.store(false, Ordering::Release);
+        if install_ok {
+            self.lost_now.store(false, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -460,9 +475,11 @@ async fn manager_name_owned(conn: &Connection) -> bool {
 /// its own `AddMatch` — the real bus does not replay, and a `Type=simple`
 /// start job settles ~1 ms after the enqueue (measured 0.6 ms on the
 /// maintainer host, systemd 260.4). A failed install fires `lost` +
-/// `ready`: the match set is incomplete and signals are being lost right
-/// now — the receiver's reconnect (re-subscribe + re-sync, spec §3/§7)
-/// covers the gap.
+/// `ready(false)`: the match set is incomplete and signals are being lost
+/// right now — `install()` keeps the lost flag (no registered
+/// `connection_lost()` waiter existed for the pump's notify), so the next
+/// `connection_lost()` read fires immediately -> BusDrop -> the receiver's
+/// reconnect (re-subscribe + re-sync, spec §3/§7) covers the gap.
 async fn run_pumps(
     conn: Connection,
     job_tx: broadcast::Sender<JobRemoved>,
@@ -470,7 +487,7 @@ async fn run_pumps(
     files_tx: broadcast::Sender<()>,
     lost: Arc<Notify>,
     lost_now: Arc<AtomicBool>,
-    ready: oneshot::Sender<()>,
+    ready: oneshot::Sender<bool>,
 ) {
     let manager = match ManagerProxy::new(&conn).await {
         Ok(m) => m,
@@ -500,7 +517,7 @@ async fn run_pumps(
             return;
         }
     };
-    let _ = ready.send(());
+    let _ = ready.send(true);
     tokio::join!(
         pump_job_removed(job_stream, job_tx),
         pump_properties_changed(conn, props_stream, state_tx, files_tx.clone()),
@@ -511,12 +528,13 @@ async fn run_pumps(
 }
 
 /// A match install failed (or the connection died mid-install): raise the
-/// lost event and fire `ready`, so `install()`'s await is bounded on
-/// every exit path.
-fn finish_pumps(lost_now: &Arc<AtomicBool>, lost: &Arc<Notify>, ready: oneshot::Sender<()>) {
+/// lost event and fire `ready(false)`, so `install()`'s await is bounded
+/// on every exit path and the failed install is reported to it (it keeps
+/// the lost flag — see [`ZbusCtl::install`]).
+fn finish_pumps(lost_now: &Arc<AtomicBool>, lost: &Arc<Notify>, ready: oneshot::Sender<bool>) {
     lost_now.store(true, Ordering::Release);
     lost.notify_waiters();
-    let _ = ready.send(());
+    let _ = ready.send(false);
 }
 
 /// Every `JobRemoved` → the seam channel (spec §3). `send` only fails when

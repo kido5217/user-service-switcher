@@ -33,8 +33,8 @@
 #     wb member (wb2) (the fresh daemon re-reads ActiveState live at
 #     command time — without re-sync the snapshot would read all-inactive
 #     and the switch would skip the stop phase); then kill ussd -9
-#     (socket gone from under the next uss -> bootstrap step 6 restart ->
-#     re-sync again) and read a byte-exact status across the disruption
+#     (socket gone from under the next uss -> bootstrap step 4 restart
+#     (StartUnit) -> re-sync again) and read a byte-exact status across the disruption
 #     (m stays Active — the wc group is untouched, its single active
 #     member satisfies the invariant, and its re-emitted edge is deduped
 #     against the re-sync baseline). groups.json is asserted UNTOUCHED at
@@ -281,7 +281,8 @@ run_uss "3g: wb start uss-e2e-wb1 (no-op: target active, others active too? no �
 assert_eq "3g: wb2 stopped (live re-read, not a stale snapshot)" "inactive" "$(unit_is uss-e2e-wb2.service)"
 assert_eq "3g: wb1 active" "active" "$(unit_is uss-e2e-wb1.service)"
 # Kill the daemon abruptly (socket disappears under the next command) ->
-# bootstrap step 6 + re-sync again; the byte-exact status is the proof.
+# bootstrap step 4 (StartUnit) + re-sync again; the byte-exact status is
+# the proof.
 # m stays Active: nothing between 3e and here touches the wc group (3g's
 # switch is group-scoped to wb), and the fresh daemon's re-sync accounts
 # for m's out-of-band start (its re-emitted edge is deduped, §7) — no
