@@ -17,6 +17,20 @@
 //! and the edge is consumed: the group stays double-active until the next
 //! start edge re-asserts the invariant. No automatic membership changes
 //! anywhere in this module.
+//!
+//! A re-emitted `ActiveState` value with the same transition timestamp is
+//! not an edge (ticket #23, host-grounded 2026-10-11: the manager re-dumps
+//! unchanged unit properties — including `ActiveState` — in follow-up
+//! `PropertiesChanged`s when sibling properties change, e.g. when the `Job`
+//! property settles; the re-emission carries the SAME
+//! `StateChangeTimestampMonotonic` as the original transition). The dedup
+//! baseline is the last known (value, timestamp) per unit, updated from
+//! pushes and the resync family of reads — not from a reaction's own live
+//! read, which observes current state without accounting for transitions.
+//! Separately, a reaction only stops members whose transition timestamp is
+//! not NEWER than the edge's own: the live read is a ~tens-of-ms window
+//! that can observe a concurrent out-of-band start, whose own (newer) edge
+//! asserts the invariant.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -29,6 +43,14 @@ use crate::systemdctl::{ActiveState, SystemdCtl, UnitState, UnitStateChanged};
 /// Queued member edges, processed serially in push order.
 pub struct Watchdog {
     pending: VecDeque<UnitStateChanged>,
+    /// Edge dedup baseline (ticket #23, module docs): the last known
+    /// (`ActiveState`, transition timestamp) per unit, from pushes and the
+    /// resync family of reads (startup / reconnect / lag). A push equal to
+    /// it — same value AND same `StateChangeTimestampMonotonic` — is a
+    /// re-emission, not an edge. The reaction's own live read does NOT
+    /// update the baseline: it observes current state, it does not
+    /// account for transitions.
+    last: HashMap<String, (ActiveState, u64)>,
 }
 
 /// The outcome of processing one queued edge.
@@ -68,6 +90,7 @@ impl Watchdog {
     pub fn new() -> Self {
         Self {
             pending: VecDeque::new(),
+            last: HashMap::new(),
         }
     }
 
@@ -111,8 +134,32 @@ impl Watchdog {
     /// Queue a member `ActiveState` edge (the daemon's signal pump calls
     /// this for every edge). Processing is serial — [`Self::process_next`]
     /// pops in push order.
+    ///
+    /// A re-emitted value with the SAME transition timestamp as the last
+    /// known state for that unit is NOT queued (ticket #23, module docs):
+    /// the manager re-dumps units in follow-up `PropertiesChanged`s (e.g.
+    /// when the `Job` property settles) with the unchanged `ActiveState`
+    /// and the same `StateChangeTimestampMonotonic`.
     pub fn push_edge(&mut self, edge: UnitStateChanged) {
+        match self.last.get(edge.unit.as_str()) {
+            Some((state, ts)) if state == &edge.active_state && ts == &edge.ts => return,
+            _ => {}
+        }
+        self.last
+            .insert(edge.unit.to_owned(), (edge.active_state.clone(), edge.ts));
         self.pending.push_back(edge);
+    }
+
+    /// Refresh the edge dedup baseline from a fresh read (startup /
+    /// reconnect / lag re-sync, unit-file re-validation): a re-emitted
+    /// value with the same transition timestamp as a fresh read is not an
+    /// edge (ticket #23). The reaction's own live read does not use this —
+    /// it observes, it does not account.
+    pub fn note_states(&mut self, states: &[(String, UnitState)]) {
+        for (unit, state) in states {
+            self.last
+                .insert(unit.to_owned(), (state.active_state.clone(), state.ts));
+        }
     }
 
     /// Process the next queued edge against the LIVE state (spec §7):
@@ -167,22 +214,39 @@ impl Watchdog {
         // stop-target set read the same snapshot.
         let members = groups.members(group).unwrap().to_vec();
         let states = ctl.list_states(&members).await.map_err(map_query_error)?;
-        let live: HashMap<&str, ActiveState> = states
+        let live: HashMap<&str, (ActiveState, u64)> = states
             .iter()
-            .map(|(name, s)| (name.as_str(), s.active_state.clone()))
+            .map(|(name, s)| (name.as_str(), (s.active_state.clone(), s.ts)))
             .collect();
 
-        if live.get(edge.unit.as_str()).cloned() != Some(ActiveState::Active) {
-            // Stale: not `active` when the edge ran (e.g. just stopped by
-            // a prior reaction) — dropped (spec §7).
-            return Ok(Some(Reaction::Stale));
+        match live.get(edge.unit.as_str()) {
+            Some((ActiveState::Active, _)) => {}
+            _ => {
+                // Stale: not `active` when the edge ran (e.g. just stopped by
+                // a prior reaction) — dropped (spec §7).
+                return Ok(Some(Reaction::Stale));
+            }
         }
 
+        // The other members to stop (ticket #23, host-grounded 2026-10-11):
+        // live `active` AND whose transition timestamp is not NEWER than
+        // this edge's own — a member that transitioned after this edge's
+        // event has its own (newer) edge asserting the invariant, so this
+        // edge must not stop it (the live read is a ~tens-of-ms window and
+        // can observe a concurrent out-of-band start). An unknown edge
+        // timestamp (`0`) falls back to the legacy stop-on-live-active
+        // behavior.
         let others: Vec<&String> = members
             .iter()
             .filter(|m| {
-                m.as_str() != edge.unit
-                    && live.get(m.as_str()).cloned() == Some(ActiveState::Active)
+                if m.as_str() == edge.unit {
+                    return false;
+                }
+                matches!(
+                    live.get(m.as_str()),
+                    Some((ActiveState::Active, ts))
+                        if *ts <= edge.ts || edge.ts == 0
+                )
             })
             .collect();
         if others.is_empty() {
@@ -293,6 +357,7 @@ mod tests {
         wd.push_edge(UnitStateChanged {
             unit: "b.service".into(),
             active_state: ActiveState::Active,
+            ts: 0,
         });
         let outcome = run_process(&fake, &mut wd, &groups, &mut book, settle_done_inactive)
             .await
@@ -325,6 +390,7 @@ mod tests {
             wd.push_edge(UnitStateChanged {
                 unit: "a.service".into(),
                 active_state: edge_state.clone(),
+                ts: 0,
             });
             let outcome = run_process(&fake, &mut wd, &groups, &mut book, settle_done_inactive)
                 .await
@@ -354,6 +420,7 @@ mod tests {
         wd.push_edge(UnitStateChanged {
             unit: "b.service".into(),
             active_state: ActiveState::Active,
+            ts: 0,
         });
         let outcome = run_process(&fake, &mut wd, &groups, &mut book, settle_done_inactive)
             .await
@@ -366,12 +433,145 @@ mod tests {
         // Spec §7 wording — suppression matches in-flight START jobs only:
         // an edge on a unit with an in-flight ussd STOP job is NOT
         // suppressed (unreachable in practice: per-unit job
-        // serialization, but the rule is pinned here).
+        // serialization, but the rule is pinned here). The intermediate
+        // `inactive` edge returns the dedup baseline, so the second
+        // `active` edge is a true value change, not a re-emission
+        // (ticket #23).
         book.settle(1);
         book.record(JobHandle { id: 2 }, "b.service".into(), JobPurpose::Stop);
         wd.push_edge(UnitStateChanged {
             unit: "b.service".into(),
+            active_state: ActiveState::Inactive,
+            ts: 0,
+        });
+        let outcome = run_process(&fake, &mut wd, &groups, &mut book, settle_done_inactive)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, Reaction::NoStartEdge);
+        wd.push_edge(UnitStateChanged {
+            unit: "b.service".into(),
             active_state: ActiveState::Active,
+            ts: 0,
+        });
+        let outcome = run_process(&fake, &mut wd, &groups, &mut book, settle_done_inactive)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outcome,
+            Reaction::Stops {
+                stopped: vec!["a.service".into()],
+                failed: vec![]
+            }
+        );
+    }
+
+    // -- edge dedup (ticket #23) ----------------------------------------------
+
+    #[tokio::test]
+    async fn re_emitted_same_value_is_not_an_edge() {
+        let fake = FakeSystemdCtl::new();
+        fake.set_active("a.service");
+        let mut groups = Groups::default();
+        groups.add_member("vpn", "a.service");
+        let mut wd = Watchdog::new();
+        let mut book = JobBook::default();
+
+        // The manager re-dumps unchanged `ActiveState` in follow-up
+        // `PropertiesChanged`s (host-grounded 2026-10-11, ticket #23):
+        // re-emitted values are not edges — three pushes, two edges.
+        wd.push_edge(UnitStateChanged {
+            unit: "a.service".into(),
+            active_state: ActiveState::Active,
+            ts: 0,
+        });
+        wd.push_edge(UnitStateChanged {
+            unit: "a.service".into(),
+            active_state: ActiveState::Active,
+            ts: 0,
+        });
+        wd.push_edge(UnitStateChanged {
+            unit: "a.service".into(),
+            active_state: ActiveState::Inactive,
+            ts: 0,
+        });
+        let r1 = run_process(&fake, &mut wd, &groups, &mut book, settle_done_inactive)
+            .await
+            .unwrap();
+        assert!(r1.is_some());
+        let r2 = run_process(&fake, &mut wd, &groups, &mut book, settle_done_inactive)
+            .await
+            .unwrap();
+        assert!(r2.is_some());
+        let r3 = run_process(&fake, &mut wd, &groups, &mut book, settle_done_inactive)
+            .await
+            .unwrap();
+        assert!(r3.is_none());
+
+        // `note_states` refreshes the baseline from a fresh read: a
+        // re-emitted current state after a read is not an edge, a value
+        // change is.
+        wd.note_states(&[(
+            "a.service".into(),
+            UnitState {
+                load_state: LoadState::Loaded,
+                active_state: ActiveState::Active,
+                ts: 0,
+            },
+        )]);
+        wd.push_edge(UnitStateChanged {
+            unit: "a.service".into(),
+            active_state: ActiveState::Active,
+            ts: 0,
+        });
+        assert!(wd.is_empty());
+        wd.push_edge(UnitStateChanged {
+            unit: "a.service".into(),
+            active_state: ActiveState::Inactive,
+            ts: 0,
+        });
+        assert!(!wd.is_empty());
+    }
+
+    #[tokio::test]
+    async fn newer_member_transition_is_not_stopped_by_the_older_edge() {
+        let fake = FakeSystemdCtl::new();
+        // Both members are active; `a`'s transition is the OLDER one
+        // (the fake clock advances on every mutation, ticket #23).
+        fake.set_active("a.service");
+        fake.set_active("b.service");
+        let ts_a = fake.get_unit_state("a.service").await.unwrap().ts;
+        let ts_b = fake.get_unit_state("b.service").await.unwrap().ts;
+        assert!(ts_a < ts_b);
+        let mut groups = Groups::default();
+        groups.add_member("vpn", "a.service");
+        groups.add_member("vpn", "b.service");
+        let mut wd = Watchdog::new();
+        let mut book = JobBook::default();
+
+        // `a`'s edge (the older transition) runs first: `b`'s live
+        // transition is NEWER than `a`'s edge — `b` must not be stopped
+        // (its own, newer edge asserts the invariant). This is the e2e
+        // scenario-1 interleaving: a slow live read observing a
+        // concurrent out-of-band start.
+        wd.push_edge(UnitStateChanged {
+            unit: "a.service".into(),
+            active_state: ActiveState::Active,
+            ts: ts_a,
+        });
+        let outcome = run_process(&fake, &mut wd, &groups, &mut book, settle_done_inactive)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, Reaction::NoConflicts);
+
+        // `b`'s edge (the newer transition): `a`'s transition is older —
+        // stopped. The last starter wins, regardless of processing order.
+        wd.push_edge(UnitStateChanged {
+            unit: "b.service".into(),
+            active_state: ActiveState::Active,
+            ts: ts_b,
         });
         let outcome = run_process(&fake, &mut wd, &groups, &mut book, settle_done_inactive)
             .await
@@ -405,6 +605,7 @@ mod tests {
         wd.push_edge(UnitStateChanged {
             unit: "b.service".into(),
             active_state: ActiveState::Active,
+            ts: 0,
         });
         // Settle the queued job but keep `a` active (an in-flight start
         // completed) → the rule re-issues once; settle that too.
@@ -471,6 +672,7 @@ mod tests {
         wd.push_edge(UnitStateChanged {
             unit: "b.service".into(),
             active_state: ActiveState::Active,
+            ts: 0,
         });
         let outcome = run_process(&fake, &mut wd, &groups, &mut book, settle_done_inactive)
             .await
@@ -500,6 +702,7 @@ mod tests {
             wd.push_edge(UnitStateChanged {
                 unit: unit.into(),
                 active_state: ActiveState::Active,
+                ts: 0,
             });
         }
 
@@ -565,6 +768,7 @@ mod tests {
             wd.push_edge(UnitStateChanged {
                 unit: unit.into(),
                 active_state: ActiveState::Active,
+                ts: 0,
             });
             last = run_process(&fake, &mut wd, &groups, &mut book, settle_done_inactive)
                 .await
@@ -609,6 +813,7 @@ mod tests {
         wd.push_edge(UnitStateChanged {
             unit: "b.service".into(),
             active_state: ActiveState::Active,
+            ts: 0,
         });
         let settle_failed = |f: &FakeSystemdCtl, id: u64| {
             f.settle_job(id, JobResult::Failed);
@@ -642,6 +847,7 @@ mod tests {
         wd.push_edge(UnitStateChanged {
             unit: "c.service".into(),
             active_state: ActiveState::Active,
+            ts: 0,
         });
         let settle_round2 = |f: &FakeSystemdCtl, id: u64| {
             let unit = f

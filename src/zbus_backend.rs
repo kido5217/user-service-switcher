@@ -51,7 +51,10 @@
 //! One pump task per connection forwards every `JobRemoved`, every unit
 //! `PropertiesChanged` edge, and every unit-file change (the manager's
 //! `UnitFilesChanged` plus a unit's `Reloading` property dropping to
-//! `false`) onto the seam's broadcast channels. The
+//! `false`) onto the seam's broadcast channels. The pump installs its
+//! broker matches before `connect()` returns (ticket #23, host-grounded
+//! 2026-10-11), so a seam signal wait cannot race its own `AddMatch` on
+//! the real bus, which has no replay. The
 //! pump loop never exits on a bad message (skip + continue), and D-Bus
 //! applies broker-side backpressure when the per-match queue fills — so
 //! delivery stalls rather than drops. Receiver lag still drops *the lagging
@@ -85,10 +88,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use tokio::sync::{Mutex, Notify, broadcast};
+use tokio::sync::{Mutex, Notify, broadcast, oneshot};
 use zbus::zvariant::OwnedValue;
 use zbus::{Connection, MatchRule, MessageStream};
-use zbus_systemd::systemd1::{ManagerProxy, UnitProxy};
+use zbus_systemd::systemd1::{JobRemovedStream, ManagerProxy, UnitProxy};
 
 use crate::systemdctl::{
     ActiveState, CtlError, JobHandle, JobRemoved, JobResult, LoadState, SystemdCtl, UnitState,
@@ -338,6 +341,10 @@ impl ZbusCtl {
     /// closing) is abandoned — the socket is closed, the pumps retire,
     /// and the new connection attempt re-checks the name. Installs the
     /// signal pumps for the new connection and retires the old task.
+    /// Returns only once the new pump's broker matches are installed
+    /// (`ready` observed, see [`run_pumps`]) — a `JobRemoved` wait started
+    /// on the returned connection must never race its own `AddMatch`
+    /// (the real bus has no replay; ticket #23).
     async fn install(&self, conn: Result<Connection, zbus::Error>) -> Result<(), CtlError> {
         let mut state = self.state.lock().await;
         if let Some(shared) = state.take() {
@@ -377,6 +384,7 @@ impl ZbusCtl {
             .await
             .map_err(|_| CtlError::ManagerAbsent)?;
         let conn_handle = conn.clone();
+        let (ready_tx, ready_rx) = oneshot::channel::<bool>();
         let pumps = tokio::spawn(run_pumps(
             conn,
             self.job_tx.clone(),
@@ -384,7 +392,35 @@ impl ZbusCtl {
             self.files_tx.clone(),
             self.lost.clone(),
             self.lost_now.clone(),
+            ready_tx,
         ));
+        // `connect()` returns only once the pump's broker matches are
+        // installed (ticket #23, see `run_pumps`): the real bus has no
+        // replay, so a `JobRemoved` wait must not race its own `AddMatch`.
+        // The pump fires `ready` on every exit path, and its match
+        // round-trips inherit the connection's 30 s method timeout — this
+        // await is bounded.
+        let install_ok = match ready_rx.await {
+            Ok(install_ok) => install_ok,
+            Err(_) => {
+                // The pump task dropped `ready_tx` (aborted): abandon the
+                // connection like the stale-connection path above.
+                let _ = conn_handle.close().await;
+                pumps.abort();
+                let _ = pumps.await;
+                return Err(CtlError::ManagerAbsent);
+            }
+        };
+        if !install_ok {
+            // The new pump's broker match install failed: the pump set the
+            // lost flag and notified before firing `ready` (`finish_pumps`)
+            // — but this `install` holds the mutex and the daemon is inside
+            // `connect()`, so no `connection_lost()` waiter was registered
+            // to receive that notify. KEEP the flag: the next
+            // `connection_lost()` read fires immediately -> BusDrop -> the
+            // daemon's reconnect (re-subscribe + re-sync, spec §3/§7)
+            // covers the gap.
+        }
         if let Some(old) = state.replace(Shared {
             conn: conn_handle,
             manager,
@@ -397,7 +433,9 @@ impl ZbusCtl {
             old.pumps.abort();
             let _ = old.pumps.await;
         }
-        self.lost_now.store(false, Ordering::Release);
+        if install_ok {
+            self.lost_now.store(false, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -430,6 +468,18 @@ async fn manager_name_owned(conn: &Connection) -> bool {
 /// streams end (streams only end when the connection closes —
 /// per-message problems are skipped inside the loops), which is the
 /// connection-lost event.
+///
+/// All broker matches are installed before `ready` fires (ticket #23,
+/// host-grounded 2026-10-11): `connect()` returns only once they are in
+/// place, so a `JobRemoved` wait started on this connection cannot race
+/// its own `AddMatch` — the real bus does not replay, and a `Type=simple`
+/// start job settles ~1 ms after the enqueue (measured 0.6 ms on the
+/// maintainer host, systemd 260.4). A failed install fires `lost` +
+/// `ready(false)`: the match set is incomplete and signals are being lost
+/// right now — `install()` keeps the lost flag (no registered
+/// `connection_lost()` waiter existed for the pump's notify), so the next
+/// `connection_lost()` read fires immediately -> BusDrop -> the receiver's
+/// reconnect (re-subscribe + re-sync, spec §3/§7) covers the gap.
 async fn run_pumps(
     conn: Connection,
     job_tx: broadcast::Sender<JobRemoved>,
@@ -437,30 +487,60 @@ async fn run_pumps(
     files_tx: broadcast::Sender<()>,
     lost: Arc<Notify>,
     lost_now: Arc<AtomicBool>,
+    ready: oneshot::Sender<bool>,
 ) {
     let manager = match ManagerProxy::new(&conn).await {
         Ok(m) => m,
         Err(_) => {
-            lost_now.store(true, Ordering::Release);
-            lost.notify_waiters();
+            finish_pumps(&lost_now, &lost, ready);
             return;
         }
     };
-    let job_pump = pump_job_removed(manager.clone(), job_tx);
-    let props_pump = pump_properties_changed(conn, state_tx, files_tx.clone());
-    let files_pump = pump_unit_files_changed(manager, files_tx);
-    tokio::join!(job_pump, props_pump, files_pump);
+    let job_stream = match manager.receive_job_removed().await {
+        Ok(stream) => stream,
+        Err(_) => {
+            finish_pumps(&lost_now, &lost, ready);
+            return;
+        }
+    };
+    let props_stream = match props_changed_match(&conn).await {
+        Ok(stream) => stream,
+        Err(_) => {
+            finish_pumps(&lost_now, &lost, ready);
+            return;
+        }
+    };
+    let files_stream = match unit_files_changed_match(&manager).await {
+        Ok(stream) => stream,
+        Err(_) => {
+            finish_pumps(&lost_now, &lost, ready);
+            return;
+        }
+    };
+    let _ = ready.send(true);
+    tokio::join!(
+        pump_job_removed(job_stream, job_tx),
+        pump_properties_changed(conn, props_stream, state_tx, files_tx.clone()),
+        pump_unit_files_changed(files_stream, files_tx),
+    );
     lost_now.store(true, Ordering::Release);
     lost.notify_waiters();
+}
+
+/// A match install failed (or the connection died mid-install): raise the
+/// lost event and fire `ready(false)`, so `install()`'s await is bounded
+/// on every exit path and the failed install is reported to it (it keeps
+/// the lost flag — see [`ZbusCtl::install`]).
+fn finish_pumps(lost_now: &Arc<AtomicBool>, lost: &Arc<Notify>, ready: oneshot::Sender<bool>) {
+    lost_now.store(true, Ordering::Release);
+    lost.notify_waiters();
+    let _ = ready.send(false);
 }
 
 /// Every `JobRemoved` → the seam channel (spec §3). `send` only fails when
 /// no receiver holds the channel or a receiver lagged — both are the
 /// receiver's re-sync concern, not a pump exit.
-async fn pump_job_removed(manager: ManagerProxy<'static>, tx: broadcast::Sender<JobRemoved>) {
-    let Ok(mut stream) = manager.receive_job_removed().await else {
-        return;
-    };
+async fn pump_job_removed(mut stream: JobRemovedStream, tx: broadcast::Sender<JobRemoved>) {
     while let Some(signal) = stream.next().await {
         let Ok(args) = signal.args() else {
             continue; // malformed: skip, keep pumping
@@ -479,25 +559,15 @@ async fn pump_job_removed(manager: ManagerProxy<'static>, tx: broadcast::Sender<
 /// unit objects under `/org/freedesktop/systemd1/unit/` and only the
 /// `org.freedesktop.systemd1.Unit` interface (where `ActiveState` is
 /// declared); an invalidated (value-less) `ActiveState` is re-read so the
-/// edge still carries a state.
+/// edge still carries a state. The match is installed by
+/// [`props_changed_match`] before the pump's `ready` fires (see
+/// [`run_pumps`]).
 async fn pump_properties_changed(
     conn: Connection,
+    mut stream: MessageStream,
     tx: broadcast::Sender<UnitStateChanged>,
     files_tx: broadcast::Sender<()>,
 ) {
-    let Ok(rule) = MatchRule::builder()
-        .msg_type(zbus::message::Type::Signal)
-        .sender(MANAGER)
-        .and_then(|b| b.interface("org.freedesktop.DBus.Properties"))
-        .and_then(|b| b.member("PropertiesChanged"))
-        .map(|b| b.build())
-    else {
-        return;
-    };
-    let Ok(mut stream) = MessageStream::for_match_rule(rule, &conn, Some(SIGNAL_CAPACITY)).await
-    else {
-        return;
-    };
     while let Some(msg) = stream.next().await {
         let Ok(msg) = msg else { continue };
         let header = msg.header();
@@ -536,9 +606,17 @@ async fn pump_properties_changed(
         }
         if let Some(value) = changed.get("ActiveState") {
             if let Ok(state) = value.downcast_ref::<&str>() {
+                // The edge's transition timestamp (ticket #23): the
+                // reaction orders start edges against the live read's
+                // per-unit timestamps; `0` (absent) = unknown.
+                let ts = changed
+                    .get("StateChangeTimestampMonotonic")
+                    .and_then(|v| v.downcast_ref::<u64>().ok())
+                    .unwrap_or(0);
                 let _ = tx.send(UnitStateChanged {
                     unit: unit.clone(),
                     active_state: active_state_from_wire(state),
+                    ts,
                 });
             }
         }
@@ -560,12 +638,17 @@ async fn pump_properties_changed(
                         .build()
                         .await
                         .ok()?;
-                    proxy.active_state().await.ok()
+                    let state = proxy.active_state().await.ok()?;
+                    Some((
+                        state,
+                        proxy.state_change_timestamp_monotonic().await.unwrap_or(0),
+                    ))
                 };
-                if let Some(state) = reread.await {
+                if let Some((state, ts)) = reread.await {
                     let _ = tx.send(UnitStateChanged {
                         unit,
                         active_state: active_state_from_wire(&state),
+                        ts,
                     });
                 }
             });
@@ -575,27 +658,40 @@ async fn pump_properties_changed(
 
 /// The manager's `UnitFilesChanged` signal → the unit-file-change channel
 /// (spec §7) — unit files changed on disk: the watchdog re-validates
-/// member unit files (newly masked/removed).
-async fn pump_unit_files_changed(manager: ManagerProxy<'static>, tx: broadcast::Sender<()>) {
-    let Ok(rule) = MatchRule::builder()
-        .msg_type(zbus::message::Type::Signal)
-        .sender(MANAGER)
-        .and_then(|b| b.interface("org.freedesktop.systemd1.Manager"))
-        .and_then(|b| b.member("UnitFilesChanged"))
-        .map(|b| b.build())
-    else {
-        return;
-    };
-    let Ok(mut stream) =
-        MessageStream::for_match_rule(rule, manager.inner().connection(), Some(SIGNAL_CAPACITY))
-            .await
-    else {
-        return;
-    };
+/// member unit files (newly masked/removed). The match is installed by
+/// [`unit_files_changed_match`] before the pump's `ready` fires (see
+/// [`run_pumps`]).
+async fn pump_unit_files_changed(mut stream: MessageStream, tx: broadcast::Sender<()>) {
     while let Some(msg) = stream.next().await {
         let Ok(_) = msg else { continue }; // bad message: skip, keep pumping
         let _ = tx.send(());
     }
+}
+
+/// The `PropertiesChanged` broker match for unit objects (the pump's
+/// install step — see [`run_pumps`]).
+async fn props_changed_match(conn: &Connection) -> Result<MessageStream, zbus::Error> {
+    let rule = MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender(MANAGER)
+        .and_then(|b| b.interface("org.freedesktop.DBus.Properties"))
+        .and_then(|b| b.member("PropertiesChanged"))
+        .map(|b| b.build())?;
+    MessageStream::for_match_rule(rule, conn, Some(SIGNAL_CAPACITY)).await
+}
+
+/// The `UnitFilesChanged` broker match (the pump's install step — see
+/// [`run_pumps`]).
+async fn unit_files_changed_match(
+    manager: &ManagerProxy<'static>,
+) -> Result<MessageStream, zbus::Error> {
+    let rule = MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender(MANAGER)
+        .and_then(|b| b.interface("org.freedesktop.systemd1.Manager"))
+        .and_then(|b| b.member("UnitFilesChanged"))
+        .map(|b| b.build())?;
+    MessageStream::for_match_rule(rule, manager.inner().connection(), Some(SIGNAL_CAPACITY)).await
 }
 
 impl SystemdCtl for ZbusCtl {
@@ -671,9 +767,17 @@ impl SystemdCtl for ZbusCtl {
             .map_err(map_call_error)?;
         let active = unit_proxy.active_state().await.map_err(map_call_error)?;
         let load = unit_proxy.load_state().await.map_err(map_call_error)?;
+        // The unit's current transition timestamp (ticket #23): the
+        // watchdog's reaction compares it against each edge's own
+        // timestamp to decide which start edge wins.
+        let ts = unit_proxy
+            .state_change_timestamp_monotonic()
+            .await
+            .map_err(map_call_error)?;
         Ok(UnitState {
             load_state: load_state_from_wire(&load),
             active_state: active_state_from_wire(&active),
+            ts,
         })
     }
 

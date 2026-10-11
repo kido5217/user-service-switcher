@@ -293,6 +293,16 @@ pub async fn bootstrap<C: SystemdCtl>(ctl: &C, paths: &ClientPaths) -> Result<()
     //    the journal pointer — the journal names the cause.
     let state = ctl.get_unit_state(USSD_UNIT).await.map_err(map_ctl)?;
     if state.active_state != ActiveState::Active {
+        // Open the manager's signal gate on our own connection before
+        // enqueuing the start job (ADR-0002; host-grounded 2026-10-11,
+        // ticket #23): the manager emits session-bus signals only while
+        // ≥1 client has called `Subscribe()`. The stopped daemon's
+        // reference was released on its stop, and the starting daemon's
+        // lands only after the start job has already settled (a
+        // `Type=simple` job settles at fork) — without our own reference
+        // the `JobRemoved` may never be emitted at all, and the wait
+        // below is unbounded.
+        ctl.subscribe().await.map_err(map_ctl)?;
         // Subscribe BEFORE the start (the fake's streams are no-replay;
         // a job that settled before the subscribe would be lost).
         let mut rx = ctl.job_removed();
