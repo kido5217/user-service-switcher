@@ -1,0 +1,6 @@
+[Unit]
+Description=uss integration fixture @UNIT@ (ticket #24)
+
+[Service]
+Type=simple
+ExecStart=@SLEEP@ 300
