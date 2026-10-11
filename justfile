@@ -39,7 +39,8 @@ build:
 
 # Integration/e2e suite: needs a live user session (systemd user
 # manager). Single-threaded per test binary: the integration tests share
-# the ONE live manager (see tests/integration.rs module docs).
+# the ONE live manager (see tests/integration.rs module docs). Ticket
+#24.
 integration:
     @bash -c 'state=$(systemctl --user is-system-running); case "$state" in running|degraded) ;; *) echo "need a live user session (systemctl --user is-system-running: $state)" >&2; exit 1;; esac'
     cargo test -- --ignored --test-threads=1
