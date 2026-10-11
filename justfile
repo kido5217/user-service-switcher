@@ -37,6 +37,10 @@ build:
     nix build .#packages.x86_64-linux.default
     ls "$(readlink -f result)/bin/uss" "$(readlink -f result)/bin/ussd"
 
-# Integration/e2e suite: needs a live user session (systemd user manager).
+# Integration/e2e suite: needs a live user session (systemd user
+# manager). Single-threaded per test binary: the integration tests share
+# the ONE live manager (see tests/integration.rs module docs). Ticket
+#24.
 integration:
-    cargo test -- --ignored
+    @bash -c 'state=$(systemctl --user is-system-running); case "$state" in running|degraded) ;; *) echo "need a live user session (systemctl --user is-system-running: $state)" >&2; exit 1;; esac'
+    cargo test -- --ignored --test-threads=1
