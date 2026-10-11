@@ -5,6 +5,15 @@
 //! `user_service_switcher::uss_client`; this binary supplies the real
 //! D-Bus backend and the environment paths, prints `uss: <message>`
 //! errors to stderr, and exits with the §4.4 code.
+//!
+//! Test hook (spec §8): a debug build with `USS_TEST_SKIP_BOOTSTRAP` set
+//! in the environment skips the bootstrap (steps 1–4) and sends the
+//! command straight to `$XDG_RUNTIME_DIR/uss/ussd.sock` — the offline CLI
+//! harness (`tests/cli.rs`) points it at a fake ussd on a temp socket.
+//! The missing-`$XDG_RUNTIME_DIR` guard above still applies when armed
+//! (step 5 locates the socket from that dir). `cfg!(debug_assertions)`
+//! short-circuits the read in release builds, so the shipped binary
+//! ignores the variable entirely.
 
 use std::path::PathBuf;
 
@@ -74,8 +83,18 @@ fn main() {
             unit_file: xdg_config.join("systemd").join("user").join("ussd.service"),
         };
 
-        let ctl = ZbusCtl::new();
-        match uss_client::execute(&ctl, &paths, cmd, RESPONSE_TIMEOUT).await {
+        // The bootstrap is skipped only for the offline CLI harness
+        // (spec §8/§11); release builds never honor the variable, and the
+        // bus backend is not even constructed on the skipped path.
+        let skip_bootstrap =
+            cfg!(debug_assertions) && std::env::var_os("USS_TEST_SKIP_BOOTSTRAP").is_some();
+        let result = if skip_bootstrap {
+            uss_client::send(&paths, cmd, RESPONSE_TIMEOUT).await
+        } else {
+            let ctl = ZbusCtl::new();
+            uss_client::execute(&ctl, &paths, cmd, RESPONSE_TIMEOUT).await
+        };
+        match result {
             Ok(Some(status)) => {
                 // Only `status` prints (spec §4.1: stdout carries status
                 // data only; mutations print nothing on success).

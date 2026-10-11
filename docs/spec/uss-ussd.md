@@ -94,7 +94,7 @@ vpn
 | exit | class | when | message (stderr, prefix `uss: `) |
 |---|---|---|---|
 | 0 | success | — | — |
-| 1 | usage | invalid group/service name syntax, unknown subcommand, extra args (clap handles flag errors with its own messages) | `invalid service name: 'foo.target' (use 'name' or 'name.service')`, `invalid group name: '…'` |
+| 1 | usage | invalid group/service name syntax, unknown subcommand, extra args (clap handles flag errors with its own messages) | `invalid service name: 'foo.target' (use 'name' or 'name.service')`, `invalid group name: '…'`, `a service is required (usage: uss <group> <verb> <service>)` |
 | 2 | unknown group | any command naming a group that does not exist | `no such group: <group>` |
 | 3 | not a member | `remove`/`start`/`stop` on a non-member | `<service> is not in group <group>` |
 | 4 | conflict | `add` on a service already in another group | `<service> already belongs to group <other>` |
@@ -185,6 +185,8 @@ Runs at the start of **every** `uss` command; idempotent. All steps are D-Bus on
 
 Notes: the byte-compare in step 3 covers a moved binary and spec revisions without needless reloads. Enabling ussd makes it come back at login; a plain restart of the user manager (reboot) also restores it — state in `groups.json` is untouched either way.
 
+**Test hook (ticket #21):** a debug build of `uss` with `USS_TEST_SKIP_BOOTSTRAP` set in the environment skips the bootstrap (steps 1–4) and sends the command straight to `$XDG_RUNTIME_DIR/uss/ussd.sock` (step 5) — the offline CLI harness (§11) points it at a fake ussd on a temp socket with no D-Bus at all. The binary's missing-`$XDG_RUNTIME_DIR` guard still applies when armed (step 5 needs the dir to locate the socket, so it is hook-independent). The gate is compile-time (`debug_assertions`): release builds ignore the variable, and no behavior on the unskipped path changes.
+
 ## 9. ussd unit file
 
 Written by bootstrap to `~/.config/systemd/user/ussd.service`:
@@ -220,7 +222,7 @@ WantedBy=default.target
 
 - **Seam:** a `SystemdCtl` trait in the library (connect, `subscribe`, `start_unit`/`stop_unit` → job handles, `job_removed` stream, `get_unit_state`, `list_states`, `get_unit_file_state`, `reload`, `enable_unit_files`) with two implementations: the real zbus backend and an in-memory **fake** (manual state injection, recorded jobs, signal push). ussd's core (state machine, switch logic, watchdog) takes the trait — all logic testable without systemd. _(2026-10-04, PR #29: added `get_unit_file_state` to the list — §8 step 3's unit-file check needs it; the original list omitted it.)_
 - **Unit tests (always run):** name normalization/validation; `groups.json` round-trip, atomic write, corrupt-file refusal, group create/delete lifecycle; protocol encode/decode + version mismatch; exit-code mapping; switch/watchdog state machines against the fake (out-of-band start → others stopped; own-job suppression; re-sync on reconnect; back-to-back out-of-band starts converge to exactly one active member — no zero-active, no lingering double-active).
-- **CLI tests (always run):** a fake-ussd harness speaking the protocol on a temp socket → assert exit codes, stderr messages, and stdout status formatting for every row of §4.4 and the §4.3 format.
+- **CLI tests (always run):** a fake-ussd harness speaking the protocol on a temp socket → assert exit codes, stderr messages, and stdout status formatting for every row of §4.4 and the §4.3 format. Shape (ticket #21): the real `uss` binary spawned with the §8 test hook armed and a bogus bus in the environment; a scripted fake ussd replays the daemon's exact response encodings. (The row-7 *environment* cases deliberately spawn **without** the hook — the bootstrap's step 1 on the bogus bus IS the case under test.) The bootstrap-only row-7 templates (`ussd binary not found`, `ussd failed to start`) are covered by in-process bootstrap tests against the fake seam. The hook is debug-only, so socket-path cases self-skip under a release profile (they run in full under the dev-profile test gate).
 - **Integration (opt-in, `#[ignore]` + a dev-shell script):** real user manager, fixture units (trivial sleep services). Cover: full switch cycle, status accuracy, out-of-band start via `systemd-run --user` → watchdog stops the other member within ~1 s, bootstrap from a clean `~/.config/uss` + unit dir (first use installs and starts ussd), reboot-resilience of state (stop manager, `uss` again).
 - **No FFI, no system build deps:** the pure-Rust dependency set builds in the existing nix dev shell; the integration script runs inside a real session (`loginctl`-enabled host).
 

@@ -322,10 +322,7 @@ pub async fn bootstrap<C: SystemdCtl>(ctl: &C, paths: &ClientPaths) -> Result<()
     Ok(())
 }
 
-/// Run one invocation: bootstrap (spec §8) → one connection (step 5:
-/// retry up to 2 s) → one request → one response (`response_timeout`,
-/// 30 s per spec §4.1 — the operation continues inside ussd and is
-/// visible via status on timeout).
+/// Run one invocation: bootstrap (spec §8) → [`send`].
 ///
 /// Returns the status payload (`Some` for `status` commands; `None` for
 /// mutations — they print nothing on success, §4.1). Client-side errors
@@ -339,7 +336,23 @@ pub async fn execute<C: SystemdCtl>(
     response_timeout: Duration,
 ) -> Result<Option<StatusResult>, Error> {
     bootstrap(ctl, paths).await?;
+    send(paths, cmd, response_timeout).await
+}
 
+/// The socket client half of an invocation (spec §8 steps 5–6, §6): one
+/// connection (retry up to 2 s — the first successful connect IS the
+/// command's connection, one per invocation), one request, one response
+/// (`response_timeout`, 30 s per spec §4.1 — the operation continues
+/// inside ussd and is visible via status on timeout).
+///
+/// Separate from [`bootstrap`] so the debug builds' `USS_TEST_SKIP_BOOTSTRAP`
+/// test hook (spec §8) can drive the real binary against a fake ussd with
+/// no D-Bus; every production invocation goes through [`execute`].
+pub async fn send(
+    paths: &ClientPaths,
+    cmd: Command,
+    response_timeout: Duration,
+) -> Result<Option<StatusResult>, Error> {
     let request = match &cmd {
         Command::StatusAll => Request::status_all(1),
         Command::StatusGroup(group) => Request::status_group(1, group),
