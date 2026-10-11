@@ -19,6 +19,12 @@
 //! the point of it is that the binary's own `RESPONSE_TIMEOUT` is 30 s
 //! and the printed reason cell is byte-exact.
 //!
+//! Profile: the §8 hook is compiled into DEBUG builds only — so the
+//! socket-path cases self-skip under a release profile (the nix build's
+//! checkPhase), while every profile-independent case (usage, help,
+//! environment-before-socket) runs everywhere. The `cargo test` gate is
+//! the dev profile, so no case is ever skipped where the gate runs.
+//!
 //! Response literals below are the shapes the REAL daemon encodes
 //! (`Response::ok/ok_empty/err` — kebab-case codes, `message` verbatim
 //! per §6; `daemon::dispatch`/`err_response` are the source), so the
@@ -33,6 +39,20 @@ use std::{fs, thread};
 
 /// The bogus bus address every spawned `uss` gets (see the module docs).
 const BOGUS_BUS: &str = "unix:path=/uss-tests-no-such-bus";
+
+/// True when the §8 `USS_TEST_SKIP_BOOTSTRAP` hook exists in the binary
+/// under test (debug builds; see the module docs). Socket-path tests
+/// early-return when false — under release they would drive a binary
+/// that ignores the hook, hit the bogus bus, and exit 7 for a reason
+/// these tests do not model. The dev-profile `cargo test` gate always
+/// has them true.
+fn debug_hook() -> bool {
+    let on = cfg!(debug_assertions);
+    if !on {
+        eprintln!("skipped: the §8 bootstrap test hook is debug-only (release profile)");
+    }
+    on
+}
 
 // -- temp environment --------------------------------------------------------
 
@@ -201,6 +221,10 @@ fn err_resp(code: &str, message: &str) -> Step {
 
 #[test]
 fn s43_all_groups_spec_example_is_byte_exact() {
+    if !debug_hook() {
+        return;
+    }
+
     let tmp = Tmp::new("s43-all");
     let fake = FakeUssd::start(
         &tmp.socket(),
@@ -227,6 +251,10 @@ fn s43_all_groups_spec_example_is_byte_exact() {
 
 #[test]
 fn s43_one_group() {
+    if !debug_hook() {
+        return;
+    }
+
     let tmp = Tmp::new("s43-one");
     let fake = FakeUssd::start(
         &tmp.socket(),
@@ -244,6 +272,10 @@ fn s43_one_group() {
 
 #[test]
 fn s43_no_groups_prints_nothing_and_exits_0() {
+    if !debug_hook() {
+        return;
+    }
+
     // §4.3: "No groups → no output, exit 0."
     let tmp = Tmp::new("s43-empty");
     FakeUssd::start(&tmp.socket(), vec![status_ok("[]")]);
@@ -253,6 +285,10 @@ fn s43_no_groups_prints_nothing_and_exits_0() {
 
 #[test]
 fn s43_members_keep_add_order_and_groups_pass_through_in_wire_order() {
+    if !debug_hook() {
+        return;
+    }
+
     // The client is a renderer: members print in wire (add) order,
     // groups in wire order — alphabetical sorting is the DAEMON's job
     // (core::status locks it against the fake); the harness locks that
@@ -275,6 +311,10 @@ fn s43_members_keep_add_order_and_groups_pass_through_in_wire_order() {
 
 #[test]
 fn s43_transient_states_print_bare() {
+    if !debug_hook() {
+        return;
+    }
+
     // The wire carries the boolean (§6): every non-active state
     // (`activating`/`deactivating`/`failed` — the daemon maps them all to
     // false) prints bare, no marker.
@@ -293,6 +333,10 @@ fn s43_transient_states_print_bare() {
 
 #[test]
 fn add_success_prints_nothing_and_normalizes_over_the_wire() {
+    if !debug_hook() {
+        return;
+    }
+
     let tmp = Tmp::new("add-ok");
     let fake = FakeUssd::start(&tmp.socket(), vec![ok_empty()]);
     let out = uss_faked(&tmp, &["dev", "add", "foo"]);
@@ -310,6 +354,10 @@ fn add_success_prints_nothing_and_normalizes_over_the_wire() {
 
 #[test]
 fn every_mutation_verb_prints_nothing_on_success() {
+    if !debug_hook() {
+        return;
+    }
+
     let tmp = Tmp::new("mutations-ok");
     let fake = FakeUssd::start(
         &tmp.socket(),
@@ -418,6 +466,10 @@ fn help_and_version_exit_0_on_stdout() {
 
 #[test]
 fn row2_unknown_group() {
+    if !debug_hook() {
+        return;
+    }
+
     // Row 2 is "any command naming a group that does not exist" —
     // a status query and a mutation share the daemon error.
     let tmp = Tmp::new("row2");
@@ -436,6 +488,10 @@ fn row2_unknown_group() {
 
 #[test]
 fn row3_not_a_member() {
+    if !debug_hook() {
+        return;
+    }
+
     let tmp = Tmp::new("row3");
     FakeUssd::start(
         &tmp.socket(),
@@ -450,6 +506,10 @@ fn row3_not_a_member() {
 
 #[test]
 fn row4_already_in_another_group() {
+    if !debug_hook() {
+        return;
+    }
+
     let tmp = Tmp::new("row4");
     FakeUssd::start(
         &tmp.socket(),
@@ -469,6 +529,10 @@ fn row4_already_in_another_group() {
 
 #[test]
 fn row5_not_found_and_masked() {
+    if !debug_hook() {
+        return;
+    }
+
     let tmp = Tmp::new("row5");
     FakeUssd::start(
         &tmp.socket(),
@@ -485,6 +549,10 @@ fn row5_not_found_and_masked() {
 
 #[test]
 fn row6_op_failed_method_rejected_carries_the_dbus_error() {
+    if !debug_hook() {
+        return;
+    }
+
     // The §6 `op-failed` message is the row-6 `Rejected` template verbatim
     // (the daemon sends `Error::OpFailed(...)`'s Display unchanged).
     let tmp = Tmp::new("row6-rej");
@@ -519,6 +587,10 @@ fn row6_op_failed_method_rejected_carries_the_dbus_error() {
 
 #[test]
 fn row6_op_failed_bad_job_results() {
+    if !debug_hook() {
+        return;
+    }
+
     // Every unsuccessful JobRemoved result the §4.2/§6 rules surface
     // (failed, canceled, timeout, dependency) rides the `job <result>`
     // template.
@@ -543,6 +615,10 @@ fn row6_op_failed_bad_job_results() {
 
 #[test]
 fn row6_op_failed_conflicting_job() {
+    if !debug_hook() {
+        return;
+    }
+
     // The §4.2 conflicting-job rule exhausted during the stop phase of
     // a switch: the target's `start` request fails on another member's
     // stop.
@@ -565,6 +641,10 @@ fn row6_op_failed_conflicting_job() {
 
 #[test]
 fn row8_daemon_internal_error_prints_the_message_verbatim() {
+    if !debug_hook() {
+        return;
+    }
+
     // The real daemon's `internal` wire message already IS the row-8
     // template (`Error::Internal`'s Display) — uss maps the exit code
     // from the code and prints the message as-is.
@@ -587,6 +667,10 @@ fn row8_daemon_internal_error_prints_the_message_verbatim() {
 
 #[test]
 fn row8_daemon_protocol_error_code_maps_to_8() {
+    if !debug_hook() {
+        return;
+    }
+
     let tmp = Tmp::new("row8-proto");
     FakeUssd::start(
         &tmp.socket(),
@@ -606,6 +690,10 @@ fn row8_daemon_protocol_error_code_maps_to_8() {
 
 #[test]
 fn row8_response_version_mismatch_is_exit_8() {
+    if !debug_hook() {
+        return;
+    }
+
     // §6 versioning: uss rejects a response version it doesn't know
     // (the client-side template carries the row-8 `daemon error:`
     // wrapper).
@@ -627,6 +715,10 @@ fn row8_response_version_mismatch_is_exit_8() {
 
 #[test]
 fn row8_garbage_response_is_a_protocol_error() {
+    if !debug_hook() {
+        return;
+    }
+
     let tmp = Tmp::new("row8-garbage");
     FakeUssd::start(
         &tmp.socket(),
@@ -681,6 +773,10 @@ fn row7_missing_xdg_runtime_dir_is_the_linger_row() {
 
 #[test]
 fn row7_socket_never_appears_is_unavailable_after_the_retry_window() {
+    if !debug_hook() {
+        return;
+    }
+
     // The hook IS armed but no fake exists: step 5's 2 s window (§8)
     // expires as `ussd unavailable (socket not ready)`.
     let tmp = Tmp::new("row7-nosock");
@@ -697,6 +793,10 @@ fn row7_socket_never_appears_is_unavailable_after_the_retry_window() {
 
 #[test]
 fn row7_silent_daemon_times_out_after_the_full_30s() {
+    if !debug_hook() {
+        return;
+    }
+
     // The one slow test on purpose (see the module docs): the binary's
     // own RESPONSE_TIMEOUT must be the spec's 30 s and the reason cell
     // byte-exact. §4.1: meanwhile the operation continues inside ussd.
