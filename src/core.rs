@@ -696,6 +696,7 @@ mod tests {
             UnitState {
                 load_state: LoadState::Stub,
                 active_state: ActiveState::Inactive,
+                ts: 0,
             },
         );
         add(&fake, "vpn", "stub.service", &mut state).await.unwrap();

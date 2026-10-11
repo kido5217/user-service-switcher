@@ -107,6 +107,11 @@ pub enum ActiveState {
 pub struct UnitState {
     pub load_state: LoadState,
     pub active_state: ActiveState,
+    /// The manager's `StateChangeTimestampMonotonic` (monotonic ns) for
+    /// this unit's current state; `0` = unknown. Ticket #23: the watchdog
+    /// orders reactions against it — a member whose transition is NEWER
+    /// than an edge's own timestamp is not stopped by that edge.
+    pub ts: u64,
 }
 
 /// A `PropertiesChanged` edge on a member's `ActiveState` (spec §7).
@@ -115,6 +120,14 @@ pub struct UnitStateChanged {
     pub unit: String,
     /// The new `ActiveState` after the change.
     pub active_state: ActiveState,
+    /// The manager's `StateChangeTimestampMonotonic` (monotonic ns) for
+    /// THIS transition; `0` = unknown. Ticket #23, host-grounded 2026-10-11
+    /// (systemd 260.4): the manager re-dumps units in follow-up
+    /// `PropertiesChanged`s (e.g. when the `Job` property settles) with the
+    /// same `ActiveState` and the same `StateChangeTimestampMonotonic` — the
+    /// reaction uses the timestamp, not the arrival order, to decide which
+    /// start edge wins.
+    pub ts: u64,
 }
 
 /// Errors the seam can report.
@@ -247,6 +260,9 @@ struct Inner {
     reloads: usize,
     /// `enable_unit_files` call log (bootstrap idempotency testing).
     enable_calls: Vec<Vec<String>>,
+    /// Fake monotonic clock (ticket #23): bumped on every state mutation;
+    /// only the ordering matters, not the value.
+    clock: u64,
 }
 
 impl Inner {
@@ -264,6 +280,7 @@ fn unknown_unit_state() -> UnitState {
     UnitState {
         load_state: LoadState::NotFound,
         active_state: ActiveState::Inactive,
+        ts: 0,
     }
 }
 
@@ -322,14 +339,24 @@ impl FakeSystemdCtl {
 
     // -- manual unit state injection (test API) -----------------------------
 
-    fn set_active_state(&self, unit: &str, active_state: ActiveState, load_state: LoadState) {
-        self.inner.lock().unwrap().states.insert(
-            unit.to_owned(),
-            UnitState {
-                load_state,
-                active_state,
-            },
-        );
+    /// Mutate the stored state and return it (ticket #23: every mutation
+    /// advances the fake clock, so the state carries a transition
+    /// timestamp).
+    fn set_active_state(
+        &self,
+        unit: &str,
+        active_state: ActiveState,
+        load_state: LoadState,
+    ) -> UnitState {
+        let mut inner = self.inner.lock().unwrap();
+        inner.clock += 1_000;
+        let state = UnitState {
+            load_state,
+            active_state,
+            ts: inner.clock,
+        };
+        inner.states.insert(unit.to_owned(), state.clone());
+        state
     }
 
     /// Inject `active` (loaded).
@@ -445,10 +472,11 @@ impl FakeSystemdCtl {
             .get(unit)
             .cloned()
             .map_or(LoadState::NotFound, |state| state.load_state);
-        self.set_active_state(unit, active_state.clone(), load_state);
+        let state = self.set_active_state(unit, active_state, load_state);
         let _ = self.state_changed_tx.send(UnitStateChanged {
             unit: unit.to_owned(),
-            active_state,
+            active_state: state.active_state,
+            ts: state.ts,
         });
     }
 
@@ -627,13 +655,6 @@ impl SystemdCtl for FakeSystemdCtl {
 mod tests {
     use super::*;
 
-    fn unit_state(load: LoadState, active: ActiveState) -> UnitState {
-        UnitState {
-            load_state: load,
-            active_state: active,
-        }
-    }
-
     #[tokio::test]
     async fn state_reads_reflect_injections() {
         let fake = FakeSystemdCtl::new();
@@ -645,35 +666,22 @@ mod tests {
         fake.set_not_found("f.service");
 
         let loaded = LoadState::Loaded;
-        assert_eq!(
-            fake.get_unit_state("a.service").await.unwrap(),
-            unit_state(loaded.clone(), ActiveState::Active)
-        );
-        assert_eq!(
-            fake.get_unit_state("b.service").await.unwrap(),
-            unit_state(loaded.clone(), ActiveState::Activating)
-        );
-        assert_eq!(
-            fake.get_unit_state("c.service").await.unwrap(),
-            unit_state(loaded.clone(), ActiveState::Inactive)
-        );
-        assert_eq!(
-            fake.get_unit_state("d.service").await.unwrap(),
-            unit_state(loaded.clone(), ActiveState::Failed)
-        );
-        assert_eq!(
-            fake.get_unit_state("e.service").await.unwrap(),
-            unit_state(LoadState::Masked, ActiveState::Inactive)
-        );
-        assert_eq!(
-            fake.get_unit_state("f.service").await.unwrap(),
-            unit_state(LoadState::NotFound, ActiveState::Inactive)
-        );
-        // Never injected: reads not-found + inactive.
-        assert_eq!(
-            fake.get_unit_state("g.service").await.unwrap(),
-            unit_state(LoadState::NotFound, ActiveState::Inactive)
-        );
+        for (name, load, active) in [
+            ("a.service", loaded.clone(), ActiveState::Active),
+            ("b.service", loaded.clone(), ActiveState::Activating),
+            ("c.service", loaded.clone(), ActiveState::Inactive),
+            ("d.service", loaded.clone(), ActiveState::Failed),
+            ("e.service", LoadState::Masked, ActiveState::Inactive),
+            ("f.service", LoadState::NotFound, ActiveState::Inactive),
+            ("g.service", LoadState::NotFound, ActiveState::Inactive),
+        ] {
+            let s = fake.get_unit_state(name).await.unwrap();
+            assert_eq!((s.load_state, s.active_state), (load, active), "{name}");
+        }
+        // Every injected state carries a transition timestamp (ticket #23);
+        // a never-injected unit reads `0` (unknown).
+        assert!(fake.get_unit_state("a.service").await.unwrap().ts > 0);
+        assert_eq!(fake.get_unit_state("g.service").await.unwrap().ts, 0);
     }
 
     #[tokio::test]
@@ -694,10 +702,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["middle.service", "alpha.service", "zeta.service"]
         );
+        let s = &states[1].1;
         assert_eq!(
-            states[1].1,
-            unit_state(LoadState::Loaded, ActiveState::Active)
+            (s.load_state.clone(), s.active_state.clone()),
+            (LoadState::Loaded, ActiveState::Active)
         );
+        assert!(s.ts > 0, "injected state carries a transition timestamp");
         assert_eq!(states[0].1.load_state, LoadState::NotFound);
     }
 
@@ -815,12 +825,14 @@ mod tests {
 
         fake.emit_state_changed("foo.service", ActiveState::Activating);
         let edge = rx.recv().await.unwrap();
+        assert_eq!(edge.unit, "foo.service");
+        assert_eq!(edge.active_state, ActiveState::Activating);
+        // The edge carries the fake's transition timestamp (ticket #23),
+        // matching the stored state's.
+        assert!(edge.ts > 0);
         assert_eq!(
-            edge,
-            UnitStateChanged {
-                unit: "foo.service".into(),
-                active_state: ActiveState::Activating
-            }
+            edge.ts,
+            fake.get_unit_state("foo.service").await.unwrap().ts
         );
         // The stored state reflects the edge too.
         assert_eq!(

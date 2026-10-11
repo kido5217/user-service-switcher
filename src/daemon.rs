@@ -40,7 +40,7 @@ use crate::core::{self, State};
 use crate::error::{Error, ErrorCode, OpError};
 use crate::jobs::JobBook;
 use crate::protocol::{self, Cmd, Request, Response};
-use crate::systemdctl::{SystemdCtl, UnitStateChanged};
+use crate::systemdctl::{SystemdCtl, UnitState, UnitStateChanged};
 use crate::watchdog::Watchdog;
 
 /// One request line's ceiling (spec §6: one JSON object per line; a
@@ -79,10 +79,11 @@ pub enum Exit {
 }
 
 /// The outcome of the reconnect sequence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Reconnect {
-    /// Re-established and re-synced.
-    Ok,
+    /// Re-established and re-synced; carries the fresh per-member states
+    /// (the edge dedup baseline, ticket #23).
+    Ok(Vec<(String, UnitState)>),
     /// The budget ran out: manager dead.
     ManagerDied,
     /// Shutdown requested during the backoff.
@@ -138,17 +139,20 @@ pub async fn run<C: SystemdCtl>(ctl: &C, cfg: Config, mut shutdown: watch::Recei
             reason: format!("user manager unavailable at startup: {e}"),
         };
     }
-    {
-        if let Err(e) = Watchdog::resync(ctl, &state.groups).await {
+    let mut watchdog = Watchdog::new();
+    let fresh = match Watchdog::resync(ctl, &state.groups).await {
+        Ok(fresh) => fresh,
+        Err(e) => {
             eprintln!("ussd: initial re-sync failed: {e} — exiting");
             return Exit::Aborted {
                 reason: format!("initial re-sync failed: {e}"),
             };
         }
-    }
+    };
+    // The fresh reads seed the edge dedup baseline (ticket #23).
+    watchdog.note_states(&fresh);
     let mut state = state;
     let mut book = JobBook::default();
-    let mut watchdog = Watchdog::new();
     let mut edge_rx = ctl.unit_state_changed();
     let mut files_rx = ctl.unit_files_changed();
 
@@ -171,9 +175,12 @@ pub async fn run<C: SystemdCtl>(ctl: &C, cfg: Config, mut shutdown: watch::Recei
     loop {
         if needs_reconnect {
             match reconnect(ctl, &state.groups, cfg.absent_budget, &shutdown).await {
-                Reconnect::Ok => {
+                Reconnect::Ok(fresh) => {
                     // The (possibly new) connection's streams: re-enable
-                    // signal reactions only after the re-sync above.
+                    // signal reactions only after the re-sync above; the
+                    // fresh reads refresh the edge dedup baseline
+                    // (ticket #23).
+                    watchdog.note_states(&fresh);
                     edge_rx = ctl.unit_state_changed();
                     files_rx = ctl.unit_files_changed();
                 }
@@ -227,8 +234,9 @@ pub async fn run<C: SystemdCtl>(ctl: &C, cfg: Config, mut shutdown: watch::Recei
                 }
             }
             Event::FilesChanged => {
-                if let Err(e) = Watchdog::revalidate_unit_files(ctl, &state.groups).await {
-                    eprintln!("ussd: unit-file re-validation failed: {e}");
+                match Watchdog::revalidate_unit_files(ctl, &state.groups).await {
+                    Ok(fresh) => watchdog.note_states(&fresh),
+                    Err(e) => eprintln!("ussd: unit-file re-validation failed: {e}"),
                 }
             }
             Event::EdgeLagged(n) => {
@@ -236,8 +244,9 @@ pub async fn run<C: SystemdCtl>(ctl: &C, cfg: Config, mut shutdown: watch::Recei
                 // semantics): the spec's answer is a re-sync, and the
                 // lagging receiver is stale — re-subscribe.
                 eprintln!("ussd: edge stream lagged ({n} events lost); re-syncing");
-                if let Err(e) = Watchdog::resync(ctl, &state.groups).await {
-                    eprintln!("ussd: re-sync after lag failed: {e}");
+                match Watchdog::resync(ctl, &state.groups).await {
+                    Ok(fresh) => watchdog.note_states(&fresh),
+                    Err(e) => eprintln!("ussd: re-sync after lag failed: {e}"),
                 }
                 edge_rx = ctl.unit_state_changed();
             }
@@ -295,11 +304,17 @@ async fn reconnect<C: SystemdCtl>(
         match ctl.connect().await {
             Ok(()) => {
                 // re-Subscribe + re-read all members' ActiveState before
-                // re-enabling signal reactions (spec §7).
-                if let Err(e) = Watchdog::resync(ctl, groups).await {
-                    eprintln!("ussd: re-sync after reconnect failed: {e}");
-                }
-                return Reconnect::Ok;
+                // re-enabling signal reactions (spec §7). A failed
+                // re-sync still reconnects: the next edge or the next
+                // re-sync path covers the gap (spec §3).
+                let fresh = match Watchdog::resync(ctl, groups).await {
+                    Ok(fresh) => fresh,
+                    Err(e) => {
+                        eprintln!("ussd: re-sync after reconnect failed: {e}");
+                        Vec::new()
+                    }
+                };
+                return Reconnect::Ok(fresh);
             }
             Err(_) => {
                 attempts += 1;
@@ -801,6 +816,7 @@ mod tests {
             UnitState {
                 load_state: LoadState::Loaded,
                 active_state: ActiveState::Inactive,
+                ts: 0,
             },
         );
 
@@ -898,7 +914,10 @@ mod tests {
         let tmp = Tmp::new("reconnect");
         let fake = std::sync::Arc::new(FakeSystemdCtl::new());
         fake.set_active("a.service");
-        fake.set_active("b.service");
+        // `b` is NOT active at startup: its out-of-band start happens
+        // after the daemon comes up, so the resync baseline reads it
+        // inactive and the phase-1 edge below is a true value change
+        // (ticket #23 dedup — a re-emitted current state is not an edge).
         fs::create_dir_all(tmp.state_path().parent().unwrap()).unwrap();
         fs::write(
             tmp.state_path(),
