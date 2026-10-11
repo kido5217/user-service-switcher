@@ -593,15 +593,21 @@ fn row6_op_failed_bad_job_results() {
 
     // Every unsuccessful JobRemoved result the §4.2/§6 rules surface
     // (failed, canceled, timeout, dependency) rides the `job <result>`
-    // template.
+    // template — under BOTH §4.2 verbs (the `<start|stop>` slot).
     for result in ["failed", "canceled", "timeout", "dependency"] {
         let tmp = Tmp::new(&format!("row6-job-{result}"));
         FakeUssd::start(
             &tmp.socket(),
-            vec![err_resp(
-                "op-failed",
-                &format!("failed to start foo.service: job {result}"),
-            )],
+            vec![
+                err_resp(
+                    "op-failed",
+                    &format!("failed to start foo.service: job {result}"),
+                ),
+                err_resp(
+                    "op-failed",
+                    &format!("failed to stop foo.service: job {result}"),
+                ),
+            ],
         );
         let out = uss_faked(&tmp, &["dev", "start", "foo"]);
         assert_uss(
@@ -609,6 +615,13 @@ fn row6_op_failed_bad_job_results() {
             6,
             "",
             &format!("uss: failed to start foo.service: job {result}"),
+        );
+        let out = uss_faked(&tmp, &["dev", "stop", "foo"]);
+        assert_uss(
+            &out,
+            6,
+            "",
+            &format!("uss: failed to stop foo.service: job {result}"),
         );
     }
 }

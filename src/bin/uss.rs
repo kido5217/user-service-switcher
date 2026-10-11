@@ -10,8 +10,10 @@
 //! in the environment skips the bootstrap (steps 1–4) and sends the
 //! command straight to `$XDG_RUNTIME_DIR/uss/ussd.sock` — the offline CLI
 //! harness (`tests/cli.rs`) points it at a fake ussd on a temp socket.
-//! `cfg!(debug_assertions)` short-circuits the read in release builds,
-//! so the shipped binary ignores the variable entirely.
+//! The missing-`$XDG_RUNTIME_DIR` guard above still applies when armed
+//! (step 5 locates the socket from that dir). `cfg!(debug_assertions)`
+//! short-circuits the read in release builds, so the shipped binary
+//! ignores the variable entirely.
 
 use std::path::PathBuf;
 
