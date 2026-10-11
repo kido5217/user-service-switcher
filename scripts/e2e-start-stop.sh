@@ -140,8 +140,10 @@ done
 [ -x "$USS" ] && [ -x "$USSD" ] || { echo "FATAL: $USS / $USSD missing — run cargo build first" >&2; exit 2; }
 # cargo test alone does not re-link the plain bin executables — refuse a
 # stale build (the ticket #20 lesson; the #22 run tests the switch code).
-NEWEST_SRC="$(find "$REPO/src" "$REPO/Cargo.toml" "$REPO/Cargo.lock" -newer "$USS" -print -quit 2>/dev/null)"
-[ -n "$NEWEST_SRC" ] && { echo "FATAL: $USS is stale ($NEWEST_SRC is newer) — run cargo build" >&2; exit 2; }
+for b in "$USS" "$USSD"; do
+  NEWEST_SRC="$(find "$REPO/src" "$REPO/Cargo.toml" "$REPO/Cargo.lock" -newer "$b" -print -quit 2>/dev/null)"
+  [ -n "$NEWEST_SRC" ] && { echo "FATAL: $b is stale ($NEWEST_SRC is newer) — run cargo build" >&2; exit 2; }
+done
 
 SLEEP_BIN=""
 for c in /run/current-system/sw/bin/sleep /bin/sleep /usr/bin/sleep; do
@@ -300,7 +302,10 @@ teardown() {
   check_state "teardown" '<absent>'
   echo "== summary: $PASS ok, $FAIL failed =="
   rm -rf "$SCRATCH"
-  [ "$FAIL" -eq 0 ]
+  # The trap's last command does NOT set the script status —
+  # an explicit exit is required, or a run with FAILs exits 0 and a
+  # gate built on `bash scripts/…` green-lights silently.
+  if [ "$FAIL" -eq 0 ]; then exit 0; else exit 1; fi
 }
 trap 'teardown' EXIT
 
