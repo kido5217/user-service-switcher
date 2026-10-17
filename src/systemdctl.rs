@@ -256,6 +256,12 @@ struct Inner {
     /// `connect` result override (test: manager-death simulation); `None`
     /// = the default `Ok(())`.
     connect_result: Option<Result<(), CtlError>>,
+    /// Mutation-call rejection override (test: a start/stop rejected with
+    /// a D-Bus error name, e.g. the manager-death `NameHasNoOwner` on a
+    /// live socket); `None` = the normal job enqueue. Honored by both
+    /// `start_unit` and `stop_unit` before any job is recorded — a dead
+    /// manager rejects the call, no job exists.
+    op_rejection: Option<CtlError>,
     /// `reload()` call count (bootstrap idempotency testing, spec §8).
     reloads: usize,
     /// `enable_unit_files` call log (bootstrap idempotency testing).
@@ -325,6 +331,14 @@ impl FakeSystemdCtl {
     /// manager-death simulation); `None` restores the default `Ok(())`.
     pub fn set_connect_result(&self, result: Option<Result<(), CtlError>>) {
         self.inner.lock().unwrap().connect_result = result;
+    }
+
+    /// Make `start_unit`/`stop_unit` reject with the given error before
+    /// recording any job (test: manager-death errors that surface as a
+    /// call rejection, e.g. `NameHasNoOwner` on a dead-but-open
+    /// connection); `None` restores the normal enqueue.
+    pub fn set_op_rejection(&self, err: Option<CtlError>) {
+        self.inner.lock().unwrap().op_rejection = err;
     }
 
     /// Simulate a bus drop (spec §6 daemon reconnect testing): the
@@ -541,6 +555,12 @@ impl SystemdCtl for FakeSystemdCtl {
 
     async fn start_unit(&self, unit: &str) -> Result<JobHandle, CtlError> {
         let mut inner = self.inner.lock().unwrap();
+        // Rejection override: the call fails before a job exists (no
+        // record, no pending entry) — the shape of a manager that died
+        // under a still-open connection.
+        if let Some(err) = inner.op_rejection.clone() {
+            return Err(err);
+        }
         // "replace" mode (man page): a pending job is dequeued with
         // result `canceled` — it never rejects.
         if let Some(replaced) = inner.pending.remove(unit) {
@@ -563,6 +583,11 @@ impl SystemdCtl for FakeSystemdCtl {
 
     async fn stop_unit(&self, unit: &str) -> Result<JobHandle, CtlError> {
         let mut inner = self.inner.lock().unwrap();
+        // Rejection override (see `start_unit`): the dead-manager call
+        // shape — fails before a job exists.
+        if let Some(err) = inner.op_rejection.clone() {
+            return Err(err);
+        }
         // "fail" mode (man page): rejected while a job is queued.
         if inner.pending.contains_key(unit) {
             return Err(CtlError::ConflictingJob {

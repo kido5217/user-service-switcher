@@ -261,12 +261,16 @@ pub async fn run<C: SystemdCtl>(ctl: &C, cfg: Config, mut shutdown: watch::Recei
                 if manager_gone {
                     // The call failed with a name-gone/no-reply error:
                     // the manager may have DIED on a still-open socket
-                    // (which does not fire `connection_lost`). Re-verify;
-                    // a healthy connection makes this a no-op early
-                    // return in the backend.
-                    if ctl.connect().await.is_err() {
-                        needs_reconnect = true;
-                    }
+                    // (which does not fire `connection_lost`). Run the
+                    // FULL reconnect sequence, not a bare `connect`:
+                    // the §6 gate applies to this path too — a healthy
+                    // connection makes `connect` a no-op early return in
+                    // the backend, but the connection may instead be NEW
+                    // (per-connection subscription lost, spec §3), and a
+                    // NoReply can cover a mutation whose job already
+                    // landed: re-Subscribe + re-sync must run before
+                    // signal reactions are trusted again (spec §7).
+                    needs_reconnect = true;
                 }
             }
             Event::BusDrop => {
@@ -972,6 +976,96 @@ mod tests {
                     .count(),
                 1,
                 "a post-reconnect edge still triggers a reaction"
+            );
+
+            let _ = shutdown_tx.send(true);
+        };
+        let (exit, ()) = tokio::join!(daemon, client);
+        assert!(matches!(exit, Exit::Clean), "{exit:?}");
+    }
+
+    #[tokio::test]
+    async fn manager_death_poke_reconnects_with_subscribe_and_resync() {
+        // The manager died under a still-open connection: the next call
+        // rejects with NameHasNoOwner (no socket close, so
+        // `connection_lost` never fires). That path must run the FULL
+        // reconnect sequence — connect + re-Subscribe + re-sync (spec
+        // §3/§7) — not a bare connect: a pre-fix daemon left the new
+        // connection unsubscribed (signal gate closed) on a stale
+        // dedup baseline.
+        let tmp = Tmp::new("pokeresync");
+        let fake = std::sync::Arc::new(FakeSystemdCtl::new());
+        fake.set_active("a.service");
+        fs::create_dir_all(tmp.state_path().parent().unwrap()).unwrap();
+        fs::write(
+            tmp.state_path(),
+            state_with_vpn(&["a.service", "b.service"]),
+        )
+        .unwrap();
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let daemon = run(&*fake, spawn_cfg(&tmp, 2), shutdown_rx);
+        let client = async {
+            for _ in 0..200 {
+                if UnixStream::connect(&tmp.socket_path()).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(fake.is_subscribed(), "startup subscribe ran");
+
+            // b is a loadable member (inactive), so a `start` reaches
+            // `start_unit` — where the dead manager rejects the call.
+            fake.set_inactive("b.service");
+
+            // The manager dies: the per-connection subscription is gone
+            // and the next mutation rejects with the name-gone error —
+            // the §4.2 stop of `a` included, so no job ever exists.
+            fake.reset_connection();
+            fake.set_op_rejection(Some(CtlError::Rejected {
+                name: "org.freedesktop.DBus.Error.NameHasNoOwner".into(),
+                message: "Target does not exist at this time".into(),
+            }));
+            let resp = client_request(
+                &tmp.socket_path(),
+                r#"{"v":1,"id":1,"cmd":"start","group":"vpn","service":"b.service"}"#,
+            )
+            .await;
+            assert!(!resp.ok, "the rejection surfaces as an error response");
+            assert_eq!(
+                resp.error,
+                Some(ErrorCode::OpFailed),
+                "the name-gone rejection passes through — the shape pokes_reconnect matches"
+            );
+
+            // The manager comes back (fake connect: immediate Ok); the
+            // rejected start is NOT replayed — the reconnect must
+            // re-subscribe and re-sync on its own. The rejection stays
+            // set while waiting: Subscribe/list_states never touch it,
+            // so recovery is the reconnect's own doing.
+            for _ in 0..200 {
+                if fake.is_subscribed() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                fake.is_subscribed(),
+                "the manager-death poke ran the full reconnect (Subscribe + re-sync)"
+            );
+            fake.set_op_rejection(None);
+
+            // Signal reactions are live again on the fresh baseline: an
+            // out-of-band start of b (inactive at the re-sync) stops a.
+            fake.emit_state_changed("b.service", ActiveState::Active);
+            settle_stop(&fake, "a.service").await;
+            assert_eq!(
+                fake.jobs()
+                    .iter()
+                    .filter(|j| j.unit == "a.service" && j.origin == JobOrigin::Stop)
+                    .count(),
+                1,
+                "a post-poke edge still triggers a reaction"
             );
 
             let _ = shutdown_tx.send(true);
