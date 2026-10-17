@@ -161,7 +161,7 @@ _(Erratum 2026-10-04, PR #28: the row-7 cell `uss: ussd binary not found (…)` 
 
   Stable error codes: `unknown-group` (2), `not-a-member` (3), `service-in-other-group` (4), `unit-not-loadable` (5), `unit-masked` (5), `op-failed` (6), `protocol` (8), `internal` (8). `message` is human-readable and safe to print verbatim. (A corrupt state file is not a protocol error: ussd cannot serve commands at all — exit 7, §5.)
 - **Concurrency:** ussd processes commands strictly **sequentially** (one global command lock; status is read-only but still takes the lock — simplest correct rule). Commands are fast (1–2 ms D-Bus round-trips; a switch additionally waits its jobs), so serialization is not a practical bottleneck and preserves the single-writer discipline against races between concurrent `uss` invocations.
-- **ussd lifecycle vs. bus:** if the session bus connection drops, ussd does not exit — it reconnects with backoff, re-`Subscribe()`s, and re-syncs (§3). (User-manager death ends ussd too; bootstrap handles the rest.)
+- **ussd lifecycle vs. bus:** if the session bus connection drops, ussd does not exit — it reconnects with backoff, re-`Subscribe()`s, and re-syncs (§3). The manager can also die with the connection still OPEN (no drop event): the death signal is a rejected call whose D-Bus error name is `NameHasNoOwner` or `NoReply`, and the SAME sequence runs — reconnect → re-`Subscribe()` → re-sync — whatever the trigger (erratum 2026-10-17, ticket #25; host-found ticket #23: a bare `connect()` on this path left a new connection unsubscribed — the §3 signal-emission gate — on a stale dedup baseline). (User-manager death ends ussd too, once reconnects exhaust the budget; bootstrap handles the rest.)
 
 ## 7. Watchdog
 
